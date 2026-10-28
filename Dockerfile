@@ -1,9 +1,8 @@
 FROM node:22-alpine
 
-# Instalar ffmpeg e python3 para suporte opcional a yt-dlp no homelab
+# Instalar ffmpeg, python3 e yt-dlp[default] (inclui yt-dlp-ejs para desafios JS do YouTube com cookies)
 RUN apk add --no-cache ffmpeg python3 py3-pip curl && \
-    curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
-    chmod a+rx /usr/local/bin/yt-dlp
+    pip3 install --no-cache-dir --break-system-packages -U "yt-dlp[default]"
 
 WORKDIR /app
 

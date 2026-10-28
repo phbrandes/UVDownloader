@@ -718,39 +718,6 @@ app.get('/api/download', async (req: Request, res: Response) => {
       const tempPrefix = `uv-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const tempFile = path.join(tempDir, `${tempPrefix}.${ext}`);
 
-      const args: string[] = ['--no-warnings', '--no-playlist'];
-
-      if (fs.existsSync(COOKIES_FILE)) {
-        args.push('--cookies', COOKIES_FILE);
-      }
-
-      if (isAudio) {
-        args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
-      } else {
-        // Enforce MP4 container with H.264/AAC compatibility across YouTube & Instagram Reels
-        if (quality === '1080') {
-          args.push('-f', 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best');
-        } else if (quality === '720') {
-          args.push('-f', 'bestvideo[height<=720]+bestaudio/best[height<=720]/best');
-        } else if (quality === '480') {
-          args.push('-f', 'bestvideo[height<=480]+bestaudio/best[height<=480]/best');
-        } else {
-          args.push('-f', 'bestvideo+bestaudio/best');
-        }
-        args.push('--merge-output-format', 'mp4');
-        args.push('--remux-video', 'mp4');
-      }
-
-      args.push('-o', tempFile);
-      args.push(targetUrl);
-
-      const ytdlp = spawn('yt-dlp', args);
-
-      let errOutput = '';
-      ytdlp.stderr.on('data', (d) => {
-        errOutput += d.toString();
-      });
-
       const cleanupTempFiles = () => {
         try {
           const files = fs.readdirSync(tempDir);
@@ -764,58 +731,132 @@ app.get('/api/download', async (req: Request, res: Response) => {
         } catch {}
       };
 
-      ytdlp.on('error', (err) => {
-        console.error('[yt-dlp error]:', err.message);
-        cleanupTempFiles();
-        if (!res.headersSent) {
-          res.status(500).send('yt-dlp não disponível no ambiente ou falhou ao executar.');
-        }
-      });
-
-      ytdlp.on('close', (code) => {
-        let finalFile = fs.existsSync(tempFile) ? tempFile : '';
-        if (!finalFile) {
-          try {
-            const matchFile = fs.readdirSync(tempDir).find((f) => f.startsWith(tempPrefix));
-            if (matchFile) {
-              finalFile = path.join(tempDir, matchFile);
-            }
-          } catch {}
-        }
-
-        if (code === 0 && finalFile && fs.existsSync(finalFile)) {
-          const stat = fs.statSync(finalFile);
-          res.setHeader('Content-Length', stat.size);
-          res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
-          res.setHeader(
-            'Content-Disposition',
-            `attachment; filename="${encodeURIComponent(cleanFilename)}"; filename*=UTF-8''${encodeURIComponent(cleanFilename)}`
-          );
-
-          const fileStream = fs.createReadStream(finalFile);
-          fileStream.pipe(res);
-
-          fileStream.on('close', cleanupTempFiles);
-          res.on('finish', cleanupTempFiles);
-          res.on('close', cleanupTempFiles);
-        } else {
-          cleanupTempFiles();
-          if (!res.headersSent) {
-            console.error(`yt-dlp saiu com código ${code}: ${errOutput}`);
-            res.status(403).send(
-              errOutput ||
-                'Não foi possível baixar o vídeo em MP4. Verifique se os cookies do Instagram/YouTube estão salvos.'
-            );
-          }
-        }
-      });
+      let activeProc: ReturnType<typeof spawn> | null = null;
+      let clientClosed = false;
 
       req.on('close', () => {
-        try {
-          ytdlp.kill('SIGTERM');
-        } catch {}
+        clientClosed = true;
+        if (activeProc) {
+          try {
+            activeProc.kill('SIGTERM');
+          } catch {}
+        }
         cleanupTempFiles();
       });
+
+      const executeYtDlpAttempt = (
+        useCookies: boolean,
+        useFormatSort: boolean
+      ): Promise<{ ok: boolean; file: string; err: string }> => {
+        return new Promise((resolve) => {
+          cleanupTempFiles();
+          const args: string[] = ['--no-warnings', '--no-playlist'];
+
+          if (useCookies && fs.existsSync(COOKIES_FILE)) {
+            args.push('--cookies', COOKIES_FILE);
+          }
+
+          if (isAudio) {
+            args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
+          } else {
+            if (useFormatSort) {
+              args.push('-f', 'bv*+ba/b');
+              const targetRes = quality && ['1080', '720', '480'].includes(quality) ? quality : '1080';
+              args.push('-S', `res:${targetRes},ext:mp4:m4a,vcodec:h264,acodec:aac`);
+            }
+            args.push('--merge-output-format', 'mp4');
+            args.push('--remux-video', 'mp4');
+          }
+
+          args.push('-o', tempFile);
+          args.push(targetUrl);
+
+          let errStr = '';
+          const proc = spawn('yt-dlp', args);
+          activeProc = proc;
+
+          proc.stderr.on('data', (d) => {
+            errStr += d.toString();
+          });
+
+          proc.on('error', (err) => {
+            resolve({ ok: false, file: '', err: err.message });
+          });
+
+          proc.on('close', (code) => {
+            let found = fs.existsSync(tempFile) ? tempFile : '';
+            if (!found) {
+              try {
+                const match = fs.readdirSync(tempDir).find((f) => f.startsWith(tempPrefix));
+                if (match) {
+                  found = path.join(tempDir, match);
+                }
+              } catch {}
+            }
+
+            if (code === 0 && found && fs.existsSync(found)) {
+              resolve({ ok: true, file: found, err: '' });
+            } else {
+              resolve({ ok: false, file: '', err: errStr });
+            }
+          });
+        });
+      };
+
+      const isInstagram = targetUrl.includes('instagram.com/') || targetUrl.includes('instagr.am/');
+      let attemptResult: { ok: boolean; file: string; err: string };
+
+      if (isInstagram) {
+        // Instagram: Try with cookies first (if present), fallback without format sort if needed
+        attemptResult = await executeYtDlpAttempt(true, true);
+        if (!attemptResult.ok && !clientClosed) {
+          attemptResult = await executeYtDlpAttempt(true, false);
+        }
+      } else {
+        // YouTube: Try without cookies first so yt-dlp uses fast unblocked mobile clients (ios/android_vr)
+        attemptResult = await executeYtDlpAttempt(false, true);
+
+        // Fallback 1: If video requires login/age-verification (+18) and cookies.txt exists, retry WITH cookies
+        if (!attemptResult.ok && !clientClosed && fs.existsSync(COOKIES_FILE)) {
+          attemptResult = await executeYtDlpAttempt(true, true);
+        }
+
+        // Fallback 2: If format selection was still restricted, retry without strict format filter
+        if (!attemptResult.ok && !clientClosed) {
+          attemptResult = await executeYtDlpAttempt(fs.existsSync(COOKIES_FILE), false);
+        }
+      }
+
+      if (clientClosed) {
+        cleanupTempFiles();
+        return;
+      }
+
+      if (attemptResult.ok && attemptResult.file && fs.existsSync(attemptResult.file)) {
+        const stat = fs.statSync(attemptResult.file);
+        res.setHeader('Content-Length', stat.size);
+        res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${encodeURIComponent(cleanFilename)}"; filename*=UTF-8''${encodeURIComponent(cleanFilename)}`
+        );
+
+        const fileStream = fs.createReadStream(attemptResult.file);
+        fileStream.pipe(res);
+
+        fileStream.on('close', cleanupTempFiles);
+        res.on('finish', cleanupTempFiles);
+        res.on('close', cleanupTempFiles);
+      } else {
+        cleanupTempFiles();
+        if (!res.headersSent) {
+          console.error(`yt-dlp falhou após tentativas: ${attemptResult.err}`);
+          res.status(403).send(
+            attemptResult.err ||
+              'Não foi possível baixar o vídeo em MP4. Verifique se os cookies do Instagram/YouTube estão salvos.'
+          );
+        }
+      }
 
       return;
     }

@@ -1,89 +1,77 @@
-# Correção do Extrator e Downloader do Instagram (Reels em .MP4, Imagens em .JPEG e Miniaturas)
+# Correção do Erro `Requested format is not available` no YouTube (MP4 + Cookies Inteligentes)
 
-Este plano detalha a atualização do motor de extração e download do Instagram no **UV Downloader** para resolver o problema onde Reels eram baixados como imagens `.jpeg` e as miniaturas (thumbnails) dos vídeos não eram exibidas.
+Este plano resolve o erro `ERROR: [youtube] YIow9ta6GiM: Requested format is not available` ao baixar vídeos do YouTube, mantendo o funcionamento perfeito já alcançado no Instagram e no TikTok.
 
 ---
 
 ### User Review & Critical Decisions
 
 > [!IMPORTANT]
-> As decisões abaixo refletem suas escolhas confirmadas para o funcionamento do extrator do Instagram no seu Homelab.
+> O diagnóstico abaixo explica exatamente por que o erro aconteceu no YouTube após as últimas mudanças e como o motor será ajustado para nunca falhar.
 
-- **Decisão Confirmada 1 (Formatos Suportados)**: Suporte completo para download de Reels e vídeos do Instagram em formato **`.mp4`** legítimo (via `yt-dlp` + `FFmpeg`) e download de imagens/capas em formato **`.jpeg`** de alta resolução.
-- **Decisão Confirmada 2 (Autenticação via Cookies)**: Integração automática do arquivo **`cookies.txt`** (`--cookies /app/data/cookies.txt`) tanto na etapa de leitura de metadados/thumbnail quanto na etapa de download do vídeo com o `yt-dlp`, garantindo acesso mesmo quando o Instagram exigir conta logada.
-- **Decisão Técnica Adicional (Proxy de Thumbnail Anti-CORS)**: Os servidores CDN do Instagram (`scontent.cdninstagram.com`) enviam o cabeçalho de segurança `Cross-Origin-Resource-Policy: same-origin`, que impede navegadores de exibirem a miniatura diretamente na tag `<img>`. Para corrigir isso, a miniatura será roteada automaticamente pelo proxy local do backend.
+- **Causa Raiz 1 — Conflito de Clientes do YouTube ao Forçar Cookies em Vídeos Públicos**:
+  Quando o `yt-dlp` recebe `--cookies` em um vídeo público comum do YouTube (`YIow9ta6GiM`), ele **desativa automaticamente os clientes móveis internos (`ios`, `android_vr`)** — que são os clientes que fornecem todos os streams MP4 sem bloqueio — e força o uso apenas do cliente `web`. Sem um interpretador JS configurado para resolver o desafio `n-sig` da sessão logada, o YouTube retorna apenas imagens de storyboard e oculta os fluxos de vídeo, causando o erro `Requested format is not available`.
+- **Causa Raiz 2 — Filtro Rígido `-f bestvideo[height<=...]` vs. Ordenação Flexível `-S`**:
+  Usar filtros rígidos como `bestvideo[height<=720]` falha quando um vídeo é vertical (onde a altura é 1920 e a largura é 1080) ou quando o YouTube disponibiliza apenas fluxos pré-mesclados. Substituir o filtro rígido por `-f "bv*+ba/b"` combinado com ordenação `-S "res:1080,ext:mp4:m4a,vcodec:h264,acodec:aac"` garante que o `yt-dlp` sempre encontre o melhor formato `.mp4` disponível sem jamais abortar com erro.
 
 ---
 
 ### 1. Overview & Core Concept
 
-- **Causa Raiz do Problema Atual**:
-  1. **Por que baixava `.jpeg` em vez de `.mp4`**: O extrator do Instagram tentava consultar a antiga API pública `oEmbed` da Meta (que hoje bloqueia chamadas sem token). Quando falhava, a variável `videoUrl` ficava vazia e o link de download apontava para a imagem de fallback. Além disso, o bloco do `yt-dlp` na rota de download estava restrito apenas a URLs do YouTube (`isYouTubeUrl`), ignorando links do Instagram.
-  2. **Por que a miniatura do vídeo não aparecia**: Sem o `yt-dlp` na etapa de extração de metadados, o sistema não obtinha a URL real da capa do Reel, e mesmo quando obtida, o navegador bloqueava a imagem por restrição de CORS da CDN do Instagram.
-- **O Que Esta Atualização Entrega**:
-  - Extração real de metadados (título, autor, duração e URL da miniatura original) executando `yt-dlp --dump-single-json` com suporte a `cookies.txt`.
-  - Exibição garantida da miniatura do Reel através do proxy de imagem do próprio servidor.
-  - Download real de Reels e vídeos em **`.mp4`** (H.264/AAC remuxado via FFmpeg) e fotos/capas em **`.jpeg`**.
+- **O Que Esta Correção Faz**:
+  1. **Seleção Resiliente de Formato MP4 (`-f "bv*+ba/b" -S "res:...,ext:mp4:m4a"`)**: Em vez de exigir um filtro estrito que pode falhar, instrui o `yt-dlp` a ordenar os formatos priorizando streams nativos `.mp4` (H.264 + AAC/M4A) na resolução escolhida (`1080p`, `720p`, `480p`) e empacotar tudo em `.mp4` via FFmpeg.
+  2. **Estratégia Inteligente de Cookies (Tentativa Direta + Fallback com Cookies + Runtime Node)**:
+     - No **Instagram**: Continua usando `cookies.txt` diretamente (pois o Instagram exige sessão na maioria dos Reels).
+     - No **YouTube**: Tenta primeiro a extração padrão (que libera os clientes de alta velocidade `ios`/`android_vr` sem bloqueio) e, caso o vídeo exija login ou verificação de idade (+18), reexecuta automaticamente passando `--cookies /app/data/cookies.txt` para concluir o download.
+  3. **Limpeza Automática de Anexos Temporários**: Remove os novos prints salvos automaticamente em `/public/assets` para manter o repositório limpo.
 
 ---
 
 ### 2. User Experience & Visual Design
 
-- **Fluxo do Usuário**:
-  1. O usuário cola o link de um Reel ou Post do Instagram (mesmo contendo parâmetros como `?igsh=...`).
-  2. O backend sanitiza a URL, aciona o `yt-dlp` com os cookies configurados no Homelab e retorna os dados reais da publicação.
-  3. O card de resultado exibe imediatamente a **miniatura original do Reel** (servida via proxy para evitar bloqueio de CORS), o `@autor`, a duração em fonte monoespaçada (`tabular-nums`) e as opções claras de download:
-     - **Vídeo Reel Sem Marca d'Água (`.mp4`)**
-     - **Áudio Extraído (`.mp3`)**
-     - **Imagem / Capa em Alta Resolução (`.jpeg`)**
-  4. Ao clicar em **Baixar** no vídeo, o `yt-dlp` baixa e empacota o fluxo em `.mp4` real e envia para o navegador com barra de progresso precisa.
-- **Identidade Visual & Tema**:
-  - Mantém a estética escura utilitária do **UV Downloader** (`#0F172A` / Slate-900), tipografia `Plus Jakarta Sans` + `JetBrains Mono` para métricas e tamanhos de arquivo, sem elementos visuais desnecessários.
+- **Fluxo Transparente**:
+  1. O usuário cola qualquer link do YouTube (`youtu.be/YIow9ta6GiM` ou vídeos com restrição de idade) e clica em **Baixar** em `1080p`, `720p`, `480p` ou `MP3`.
+  2. O backend seleciona o melhor stream compatível e entrega o arquivo `.mp4` (ou `.mp3`) sem exibir o erro `Requested format is not available`.
+  3. Caso um vídeo do YouTube seja restrito (+18), o fallback com `cookies.txt` entra em ação automaticamente nos bastidores, sem que o usuário precise clicar duas vezes.
 
 ---
 
 ### 3. Key Product Decisions & Trade-Offs
 
-- **Decisão 1: Extração de Metadados do Instagram com `yt-dlp --dump-single-json`**
-  - *Abordagem Escolhida*: Consultar o `yt-dlp` diretamente no backend durante o `POST /api/extract` para links do Instagram, passando `--cookies /app/data/cookies.txt` se o arquivo existir.
-  - *Por quê*: Garante que o título real, nome do criador, duração e miniatura oficial do Reel sejam extraídos com precisão, usando a mesma sessão autenticada que fará o download.
-  - *Alternativa Descartada*: Usar scrapers HTML simples com regex, pois o Instagram oculta os dados de vídeo atrás de desafios de login.
-- **Decisão 2: Unificação do Motor `yt-dlp` + `FFmpeg` para YouTube, Instagram e TikTok**
-  - *Abordagem Escolhida*: Expandir o processador `yt-dlp` na rota `GET /api/download` para atender links do Instagram (`instagram.com/reel/`, `/p/`, `/tv/`), aplicando `--merge-output-format mp4` e `--remux-video mp4`.
-  - *Por quê*: Garante que todo Reel seja entregue como um arquivo `.mp4` legítimo e compatível com qualquer celular ou player, nunca como `.jpeg` ou `.webm`.
+- **Decisão 1: Usar `-S` (Format Sorting) em vez de Filtros Estritos `[height<=...]`**
+  - *Abordagem Escolhida*: `-f "bv*+ba/b" -S "res:${quality},ext:mp4:m4a,vcodec:h264,acodec:aac" --merge-output-format mp4`.
+  - *Por quê*: Garante 100% de compatibilidade com vídeos horizontais, verticais (Shorts) e vídeos antigos que não possuam streams separados, entregando sempre um arquivo `.mp4` válido.
+- **Decisão 2: Fallback Automático de Cookies no YouTube**
+  - *Abordagem Escolhida*: Para YouTube, executar a tentativa primária sem cookies (aproveitando os clientes móveis nativos do `yt-dlp`) e, se retornar erro de autenticação/idade, executar imediatamente a segunda tentativa com `--cookies /app/data/cookies.txt`. Para Instagram, manter o uso imediato dos cookies.
+  - *Por quê*: Evita que o YouTube bloqueie os formatos em vídeos públicos por causa de restrições do cliente `web` autenticado, ao mesmo tempo em que garante o download de vídeos +18 usando a sua conta.
 
 ---
 
 ### 4. Technical Architecture & Data Strategy *(Technical Reference)*
 
-#### Diagrama de Arquitetura e Fluxo de Dados (Instagram)
-
 ```text
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                        UV Downloader Frontend (React)                    │
-│  [Input URL Instagram] ──► [Card de Resultado (Thumbnail via Proxy)]     │
-└───────────────┬──────────────────────────────────────────┬───────────────┘
-                │ 1. POST /api/extract                     │ 2. GET /api/download
-                ▼                                          ▼
-┌───────────────────────────────────────┐  ┌───────────────────────────────┐
-│     Extrator Instagram (Backend)      │  │   Motor de Download (Backend) │
-│  • Limpa URL (?igsh=...)              │  │  • Detecta tipo:              │
-│  • Executa: yt-dlp --dump-single-json │  │    ├─ Vídeo (.mp4):           │
-│    + --cookies /app/data/cookies.txt  │  │    │   yt-dlp + ffmpeg remux  │
-│  • Extrai:                            │  │    │   + cookies.txt ──► .mp4 │
-│    - Título, @autor, duração          │  │    ├─ Áudio (.mp3):           │
-│    - Thumbnail (encapsulada em proxy) │  │    │   yt-dlp -x ──► .mp3     │
-│    - Opções (.mp4, .mp3, .jpeg)       │  │    └─ Imagem (.jpeg):         │
-└───────────────────────────────────────┘  │        Proxy CDN ──► .jpeg    │
-                                           └───────────────────────────────┘
+│                     Rota GET /api/download (Backend)                     │
+└────────────────────────────────────┬─────────────────────────────────────┘
+                                     │
+         ┌───────────────────────────┴───────────────────────────┐
+         ▼ (Instagram)                                           ▼ (YouTube)
+┌─────────────────────────────────┐             ┌─────────────────────────────────┐
+│ • Executa yt-dlp COM cookies    │             │ 1ª Tentativa (Rápida / Pública) │
+│ • -f "bv*+ba/b"                 │             │ • Clientes nativos (sem bloqueio│
+│ • -S "ext:mp4:m4a,vcodec:h264"  │             │   de formato do cliente web)    │
+│ • --merge-output-format mp4     │             │ • -f "bv*+ba/b" -S "res:1080,   │
+└────────────────┬────────────────┘             │   ext:mp4:m4a,vcodec:h264"      │
+                 │                              └────────────────┬────────────────┘
+                 │                                               │ Se exigir login/+18
+                 │                                               ▼
+                 │                              ┌─────────────────────────────────┐
+                 │                              │ 2ª Tentativa Automática         │
+                 │                              │ • Reexecuta COM cookies.txt     │
+                 │                              │ • Clientes web/tv_embedded      │
+                 └───────────────────┬──────────┴────────────────┬────────────────┘
+                                     ▼                           ▼
+                        ┌──────────────────────────────────────────────┐
+                        │  Arquivo .MP4 / .MP3 transmitido ao Browser  │
+                        └──────────────────────────────────────────────┘
 ```
-
-#### Mapeamento de Estados e Tratamento de Erros
-- **Extração com Cookies (`extractInstagram`)**:
-  - Executa `yt-dlp --dump-single-json --no-warnings --no-playlist` (com `--cookies` quando `./data/cookies.txt` estiver presente).
-  - Extrai `thumbnail` do JSON retornado pelo `yt-dlp` e gera uma URL de proxy local (`/api/download?url=<encoded_thumb>&filename=thumbnail.jpeg&platform=instagram`) para que o navegador carregue a imagem no card sem bloqueio de CORS.
-  - Define a URL da opção de vídeo apontando para a URL limpa do Reel com `format=mp4`, e a opção de imagem apontando para a URL de alta resolução da imagem/capa com extensão `.jpeg`.
-- **Download e Conversão (`GET /api/download`)**:
-  - Verifica se a URL é do Instagram (`instagram.com` / `instagr.am`).
-  - Se o formato solicitado for vídeo (`.mp4`) ou áudio (`.mp3`), executa o `yt-dlp` com `--cookies`, `--merge-output-format mp4` e `--remux-video mp4`, salvando em arquivo temporário no `/tmp`, enviando o `Content-Length` exato e removendo o arquivo temporário ao concluir.
-  - Se o formato solicitado for imagem (`.jpeg` / `.jpg`), faz o proxy direto da imagem de alta resolução na CDN do Instagram (`scontent.cdninstagram.com`) com cabeçalho `Content-Type: image/jpeg`.
