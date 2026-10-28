@@ -4,6 +4,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
+import { spawn } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -601,7 +602,74 @@ app.get('/api/download', async (req: Request, res: Response) => {
 
     let targetUrl = decodeURIComponent(url);
 
-    // If targetUrl is an external link, stream it directly to the browser
+    const isVideoOrAudio = filename.endsWith('.mp4') || filename.endsWith('.webm') || filename.endsWith('.mp3');
+    const isYouTubeUrl = targetUrl.includes('youtube.com/watch') || targetUrl.includes('youtu.be/') || targetUrl.includes('youtube.com/shorts');
+
+    // 1. YouTube video or audio: stream directly using yt-dlp + cookies.txt to avoid 429 Too Many Requests
+    if (isYouTubeUrl && isVideoOrAudio) {
+      const isAudio = filename.endsWith('.mp3') || req.query.type === 'audio';
+      const args: string[] = ['--no-warnings', '--no-playlist', '-o', '-'];
+
+      if (fs.existsSync(COOKIES_FILE)) {
+        args.push('--cookies', COOKIES_FILE);
+      }
+
+      if (isAudio) {
+        args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
+        res.setHeader('Content-Type', 'audio/mpeg');
+      } else {
+        if (quality === '1080') {
+          args.push('-f', 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best');
+        } else if (quality === '720') {
+          args.push('-f', 'bestvideo[height<=720]+bestaudio/best[height<=720]/best');
+        } else if (quality === '480') {
+          args.push('-f', 'bestvideo[height<=480]+bestaudio/best[height<=480]/best');
+        } else {
+          args.push('-f', 'bestvideo+bestaudio/best');
+        }
+        res.setHeader('Content-Type', 'video/mp4');
+      }
+
+      args.push(targetUrl);
+
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${encodeURIComponent(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`
+      );
+
+      const ytdlp = spawn('yt-dlp', args);
+
+      ytdlp.stdout.pipe(res);
+
+      let errOutput = '';
+      ytdlp.stderr.on('data', (d) => {
+        errOutput += d.toString();
+      });
+
+      ytdlp.on('error', (err) => {
+        console.error('[yt-dlp error]:', err.message);
+        if (!res.headersSent) {
+          res.status(500).send('yt-dlp não disponível no ambiente ou falhou ao executar.');
+        }
+      });
+
+      ytdlp.on('close', (code) => {
+        if (code !== 0 && !res.headersSent) {
+          console.error(`yt-dlp saiu com código ${code}: ${errOutput}`);
+          res.status(403).send(errOutput || 'Erro ao processar mídia com yt-dlp.');
+        }
+      });
+
+      req.on('close', () => {
+        try {
+          ytdlp.kill('SIGTERM');
+        } catch {}
+      });
+
+      return;
+    }
+
+    // 2. Direct CDN files, thumbnails, and other media: stream directly via fetch
     if (targetUrl.startsWith('http://') || targetUrl.startsWith('https://')) {
       const response = await fetch(targetUrl, {
         headers: {
