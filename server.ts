@@ -506,39 +506,128 @@ async function extractInstagram(url: string) {
 async function extractPinterest(url: string) {
   let title = 'Pinterest Pin';
   let author = 'Pinterest Creator';
+  let description = 'Imagem original em altíssima definição extraída diretamente do CDN do Pinterest.';
   let highResImage = '';
   let videoUrl = '';
   let thumbnail = '';
 
+  const decodeHtmlEntities = (str: string) =>
+    str
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"')
+      .replace(/&#x27;/g, "'")
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>');
+
+  const extractMeta = (html: string, prop: string): string => {
+    const escaped = prop.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regexPropFirst = new RegExp(
+      `<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']+)["']`,
+      'i'
+    );
+    const regexContentFirst = new RegExp(
+      `<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${escaped}["']`,
+      'i'
+    );
+    const match = html.match(regexPropFirst) || html.match(regexContentFirst);
+    return match && match[1] ? decodeHtmlEntities(match[1].trim()) : '';
+  };
+
   try {
-    // Resolve short pin.it URLs if needed
+    // Resolve short pin.it URLs and localized pinterest domains (e.g., br.pinterest.com)
     const res = await fetch(url, {
       redirect: 'follow',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
       },
     });
 
     if (res.ok) {
       const html = await res.text();
-      // Extract title from <meta property="og:title">
-      const titleMatch = html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i) || html.match(/<title>([^<]+)<\/title>/i);
-      if (titleMatch && titleMatch[1]) {
-        title = titleMatch[1].replace(' | Pinterest', '').trim();
+
+      // 1. Extract Title
+      const rawTitle =
+        extractMeta(html, 'og:title') ||
+        extractMeta(html, 'twitter:title') ||
+        (html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1] ?? '');
+      if (rawTitle) {
+        title = decodeHtmlEntities(rawTitle).replace(/\s*\|\s*Pinterest$/i, '').trim();
       }
 
-      // Extract image URL from <meta property="og:image">
-      const imgMatch = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i);
-      if (imgMatch && imgMatch[1]) {
-        thumbnail = imgMatch[1];
-        // Pinterest images have /236x/, /474x/, /736x/ in CDN URLs. Replacing with /originals/ yields the original 4K/Full-HD image!
-        highResImage = imgMatch[1].replace(/\/(236x|474x|736x|564x)\//, '/originals/');
+      // 2. Extract Description
+      const rawDesc = extractMeta(html, 'og:description') || extractMeta(html, 'twitter:description');
+      if (rawDesc) {
+        description = rawDesc;
       }
 
-      // Check if video exists
-      const videoMatch = html.match(/<meta\s+property="og:video"\s+content="([^"]+)"/i) || html.match(/"(https:\/\/[^"]+\.mp4)"/i);
-      if (videoMatch && videoMatch[1]) {
-        videoUrl = videoMatch[1];
+      // 3. Extract Author / Pinner
+      const pinnerMatch =
+        html.match(/"pinner"\s*:\s*\{[^}]*"full_name"\s*:\s*"([^"]+)"/i) ||
+        html.match(/"pinner"\s*:\s*\{[^}]*"username"\s*:\s*"([^"]+)"/i) ||
+        html.match(/"native_creator"\s*:\s*\{[^}]*"full_name"\s*:\s*"([^"]+)"/i);
+      if (pinnerMatch && pinnerMatch[1]) {
+        author = pinnerMatch[1].replace(/\\u[\dA-Fa-f]{4}/g, (m) =>
+          String.fromCharCode(parseInt(m.slice(2), 16))
+        );
+      }
+
+      // 4. Extract Pin Image URL from meta tags (handles both content-first and property-first attributes)
+      const metaImage =
+        extractMeta(html, 'og:image') ||
+        extractMeta(html, 'twitter:image:src') ||
+        extractMeta(html, 'twitter:image');
+
+      if (metaImage) {
+        thumbnail = metaImage;
+
+        // Extract the unique pin asset hash path (e.g. "78/01/d1/7801d169ae06e290c2bd2df4076276d6")
+        const hashMatch = metaImage.match(/pinimg\.com\/(?:[^/]+)\/([0-9a-f]{2}\/[0-9a-f]{2}\/[0-9a-f]{2}\/[0-9a-f]+)/i);
+        if (hashMatch && hashMatch[1]) {
+          const hashPath = hashMatch[1];
+          const escapedHash = hashPath.replace(/\//g, '\\/');
+          const exactOrigRegex = new RegExp(
+            `https:\\/\\/i\\.pinimg\\.com\\/originals\\/${escapedHash}\\.(?:jpg|jpeg|png|gif|webp)`,
+            'i'
+          );
+          const exactOrigMatch = html.match(exactOrigRegex);
+          if (exactOrigMatch && exactOrigMatch[0]) {
+            highResImage = exactOrigMatch[0];
+          }
+        }
+
+        if (!highResImage) {
+          const candidateOrig = metaImage.replace(/\/(236x|474x|564x|736x|1200x|600x315)\//, '/originals/');
+          try {
+            const headRes = await fetch(candidateOrig, { method: 'HEAD' });
+            highResImage = headRes.ok ? candidateOrig : metaImage;
+          } catch {
+            highResImage = candidateOrig;
+          }
+        }
+      } else {
+        // Fallback: search for main 736x pinimg in page body if meta tags were omitted
+        const bodyImgMatch = html.match(/https:\/\/i\.pinimg\.com\/736x\/[0-9a-f/]+\.(?:jpg|jpeg|png|webp)/i);
+        if (bodyImgMatch && bodyImgMatch[0]) {
+          thumbnail = bodyImgMatch[0];
+          highResImage = thumbnail.replace('/736x/', '/originals/');
+        }
+      }
+
+      // 5. Check if Pin is a Video Pin
+      const metaVideo =
+        extractMeta(html, 'og:video') ||
+        extractMeta(html, 'og:video:secure_url') ||
+        extractMeta(html, 'og:video:url') ||
+        extractMeta(html, 'twitter:player:stream');
+      const v1VideoMatch = html.match(/https:\/\/v1\.pinimg\.com\/videos\/[^"'\s<>\\]+\.mp4/i);
+      if (metaVideo && metaVideo.includes('.mp4')) {
+        videoUrl = metaVideo;
+      } else if (v1VideoMatch && v1VideoMatch[0]) {
+        videoUrl = v1VideoMatch[0].replace(/\\u002F/g, '/').replace(/\\\//g, '/');
       }
     }
   } catch (err) {
@@ -546,11 +635,10 @@ async function extractPinterest(url: string) {
   }
 
   if (!thumbnail) {
-    thumbnail = 'https://images.unsplash.com/photo-1513542789411-b6a5d4f31634?w=800&auto=format&fit=crop&q=80';
-    highResImage = thumbnail;
+    throw new Error('Não foi possível localizar a imagem ou vídeo deste Pin do Pinterest.');
   }
 
-  const cleanTitle = (title || 'Pinterest_Image').slice(0, 40).replace(/[\\/:*?"<>|]/g, '_');
+  const cleanTitle = (title || 'Pinterest_Pin').slice(0, 45).replace(/[\\/:*?"<>|]/g, '_');
   const qualities: QualityOptionItem[] = [];
 
   if (videoUrl) {
@@ -561,30 +649,30 @@ async function extractPinterest(url: string) {
       format: 'mp4' as const,
       type: 'video' as const,
       size: '~12 MB',
-      url: `/api/download?url=${encodeURIComponent(videoUrl)}&filename=${encodeURIComponent(cleanTitle + '.mp4')}&platform=pinterest`,
+      url: `/api/download?url=${encodeURIComponent(videoUrl)}&type=video&filename=${encodeURIComponent(cleanTitle + '.mp4')}&platform=pinterest`,
       hasWatermark: false,
     });
   }
 
   qualities.push({
     id: 'pin-image-original',
-    label: 'Imagem Original Full Resolution (Alta Qualidade)',
+    label: 'Imagem Original Full Resolution (JPEG)',
     resolution: 'Original (4K/HD)',
-    format: 'jpg' as const,
+    format: 'jpeg' as const,
     type: 'image' as const,
     size: '~3.2 MB',
-    url: `/api/download?url=${encodeURIComponent(highResImage || thumbnail)}&filename=${encodeURIComponent(cleanTitle + '_original.jpg')}&platform=pinterest`,
+    url: `/api/download?url=${encodeURIComponent(highResImage || thumbnail)}&type=image&filename=${encodeURIComponent(cleanTitle + '_original.jpeg')}&platform=pinterest`,
     hasWatermark: false,
   });
 
   qualities.push({
     id: 'pin-image-standard',
-    label: 'Imagem Otimizada Web (JPG)',
+    label: 'Imagem Otimizada Web (736p JPEG)',
     resolution: '736x Padrão',
-    format: 'jpg' as const,
+    format: 'jpeg' as const,
     type: 'image' as const,
     size: '~850 KB',
-    url: `/api/download?url=${encodeURIComponent(thumbnail)}&filename=${encodeURIComponent(cleanTitle + '_standard.jpg')}&platform=pinterest`,
+    url: `/api/download?url=${encodeURIComponent(thumbnail)}&type=image&filename=${encodeURIComponent(cleanTitle + '_736x.jpeg')}&platform=pinterest`,
     hasWatermark: false,
   });
 
@@ -596,7 +684,7 @@ async function extractPinterest(url: string) {
     title,
     author,
     thumbnail: highResImage || thumbnail,
-    description: 'Imagem original em altíssima definição extraída diretamente do CDN do Pinterest.',
+    description,
     qualities,
   };
 }
