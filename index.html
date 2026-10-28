@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>UV Downloader — Baixar Vídeos e Imagens sem Marca d'Água</title>
+    <meta name="description" content="Ferramenta self-hosted de download de vídeos e imagens sem marca d'água de YouTube, Instagram, TikTok e Pinterest com seleção de qualidade e histórico persistente para homelab." />
+    <meta property="og:title" content="UV Downloader — Baixar Vídeos e Imagens sem Marca d'Água" />
+    <meta property="og:description" content="Ferramenta self-hosted de download de vídeos e imagens sem marca d'água de YouTube, Instagram, TikTok e Pinterest com seleção de qualidade e histórico persistente para homelab." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <script>
+      // Gracefully ignore WebSocket HMR disconnection in preview sandboxes
+      window.addEventListener('unhandledrejection', function (e) {
+        if (
+          e.reason &&
+          (typeof e.reason === 'string'
+            ? e.reason.includes('WebSocket')
+            : (e.reason.message && e.reason.message.includes('WebSocket')) ||
+              (e.reason.stack && e.reason.stack.includes('createWebSocketModuleRunnerTransport')))
+        ) {
+          e.preventDefault();
+        }
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

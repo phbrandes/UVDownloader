@@ -1,0 +1,6 @@
+{
+  "name": "UV Downloader",
+  "description": "Ferramenta self-hosted de download de vídeos e imagens sem marca d'água de YouTube, Instagram, TikTok e Pinterest com seleção de qualidade e histórico persistente para homelab.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

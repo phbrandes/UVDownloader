@@ -1,0 +1,12 @@
+services:
+  uv-downloader:
+    build: .
+    container_name: uv-downloader
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
