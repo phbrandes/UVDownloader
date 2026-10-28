@@ -5,6 +5,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
 import { spawn } from 'child_process';
+import os from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -90,12 +91,54 @@ interface QualityOptionItem {
   id: string;
   label: string;
   resolution?: string;
-  format: 'mp4' | 'mp3' | 'jpg' | 'png' | 'webp';
+  format: 'mp4' | 'mp3' | 'jpg' | 'jpeg' | 'png' | 'webp';
   type: 'video' | 'audio' | 'image';
   size?: string;
   url: string;
   hasWatermark: boolean;
   isDirectStream?: boolean;
+}
+
+// Helper: Extract metadata JSON using yt-dlp (automatically uses cookies.txt if present)
+async function runYtDlpJson(targetUrl: string): Promise<any | null> {
+  return new Promise((resolve) => {
+    const args: string[] = ['--dump-single-json', '--no-warnings', '--no-playlist'];
+    if (fs.existsSync(COOKIES_FILE)) {
+      args.push('--cookies', COOKIES_FILE);
+    }
+    args.push(targetUrl);
+
+    let stdout = '';
+    const proc = spawn('yt-dlp', args);
+
+    const timer = setTimeout(() => {
+      try {
+        proc.kill('SIGTERM');
+      } catch {}
+      resolve(null);
+    }, 20000);
+
+    proc.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    proc.on('error', () => {
+      clearTimeout(timer);
+      resolve(null);
+    });
+
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0 && stdout.trim()) {
+        try {
+          const parsed = JSON.parse(stdout.trim());
+          resolve(parsed);
+          return;
+        } catch {}
+      }
+      resolve(null);
+    });
+  });
 }
 
 // Platform Detection Helper
@@ -322,47 +365,95 @@ async function extractInstagram(url: string) {
   const cleanUrl = url.split('?')[0].replace(/\/+$/, '');
   const match = cleanUrl.match(/\/(?:p|reel|reels|tv)\/([a-zA-Z0-9_-]+)/);
   const shortcode = match ? match[1] : '';
-
-  let title = 'Instagram Reel';
-  let author = 'instagram_creator';
-  let thumbnail = '';
-  let mediaType: 'video' | 'image' | 'carousel' = 'video';
-  let duration = '0:30';
-  let videoUrl = '';
-  let imageUrl = '';
-
   const isReel = cleanUrl.includes('/reel/') || cleanUrl.includes('/reels/') || cleanUrl.includes('/tv/');
+  const canonicalUrl = shortcode
+    ? `https://www.instagram.com/${cleanUrl.includes('/p/') ? 'p' : 'reel'}/${shortcode}/`
+    : cleanUrl;
 
-  // Query Instagram official oEmbed endpoint with clean URL
-  try {
-    const oembedUrl = `https://api.instagram.com/oembed/?url=${encodeURIComponent(cleanUrl)}`;
-    const res = await fetch(oembedUrl, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-      },
-    });
+  let title = isReel ? 'Instagram Reel' : 'Instagram Publicação';
+  let author = '@instagram_creator';
+  let rawThumbnail = '';
+  let imageUrl = '';
+  let duration = isReel ? '0:30' : undefined;
 
-    if (res.ok) {
-      const data = await res.json();
-      title = data.title ? data.title.slice(0, 60).replace(/[\\/:*?"<>|]/g, '_') : (isReel ? 'Instagram Reel' : 'Instagram Publicação');
-      author = data.author_name ? `@${data.author_name}` : author;
-      if (data.thumbnail_url) {
-        thumbnail = data.thumbnail_url;
-        imageUrl = data.thumbnail_url;
-      }
+  // 1. Primary Method: Extract via yt-dlp with cookies.txt support
+  const ytInfo = await runYtDlpJson(canonicalUrl);
+  if (ytInfo) {
+    const rawTitle = ytInfo.title || ytInfo.description || title;
+    title = rawTitle.split('\n')[0].slice(0, 70).trim() || title;
+
+    const rawAuthor = ytInfo.channel || ytInfo.uploader || ytInfo.uploader_id;
+    if (rawAuthor) {
+      author = `@${String(rawAuthor).replace(/^@/, '')}`;
     }
-  } catch (err) {
-    console.warn('Instagram oembed fetch error:', err);
+
+    if (typeof ytInfo.duration === 'number' && ytInfo.duration > 0) {
+      const mins = Math.floor(ytInfo.duration / 60);
+      const secs = Math.floor(ytInfo.duration % 60);
+      duration = `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+    }
+
+    if (ytInfo.thumbnail) {
+      rawThumbnail = ytInfo.thumbnail;
+    } else if (Array.isArray(ytInfo.thumbnails) && ytInfo.thumbnails.length > 0) {
+      rawThumbnail = ytInfo.thumbnails[ytInfo.thumbnails.length - 1].url || '';
+    } else if (Array.isArray(ytInfo.entries) && ytInfo.entries.length > 0) {
+      const firstEntry = ytInfo.entries[0];
+      rawThumbnail = firstEntry.thumbnail || '';
+    }
+
+    // Check if there is a direct high-res image URL (e.g. photo post or cover)
+    if (ytInfo.ext === 'jpg' || ytInfo.ext === 'jpeg' || (!ytInfo.duration && ytInfo.url && !ytInfo.url.includes('.mp4'))) {
+      imageUrl = ytInfo.url;
+    } else if (Array.isArray(ytInfo.entries)) {
+      const imgEntry = ytInfo.entries.find((e: any) => e.ext === 'jpg' || e.ext === 'jpeg' || !e.duration);
+      if (imgEntry?.url) imageUrl = imgEntry.url;
+    }
+    if (!imageUrl && rawThumbnail) {
+      imageUrl = rawThumbnail;
+    }
   }
 
-  // Fallback thumbnail if none found
-  if (!thumbnail) {
-    thumbnail = 'https://images.unsplash.com/photo-1611262588024-d12430b98920?w=800&auto=format&fit=crop&q=80';
-    imageUrl = thumbnail;
+  // 2. Fallback Method: Scrape Instagram's public /embed/captioned/ page if yt-dlp had no thumbnail
+  if (!rawThumbnail && shortcode) {
+    try {
+      const embedUrl = `https://www.instagram.com/p/${shortcode}/embed/captioned/`;
+      const embedRes = await fetch(embedUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+      });
+      if (embedRes.ok) {
+        const html = await embedRes.text();
+        const imgMatch =
+          html.match(/class="EmbeddedMediaImage"[^>]+src="([^"]+)"/i) ||
+          html.match(/<img[^>]+class="[^"]*EmbeddedMediaImage[^"]*"[^>]+src="([^"]+)"/i) ||
+          html.match(/"display_url"\s*:\s*"([^"]+)"/i);
+        if (imgMatch && imgMatch[1]) {
+          rawThumbnail = imgMatch[1].replace(/&amp;/g, '&').replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+          imageUrl = rawThumbnail;
+        }
+        const userMatch = html.match(/class="UsernameText"[^>]*>([^<]+)</i);
+        if (userMatch && userMatch[1]) {
+          author = `@${userMatch[1].trim().replace(/^@/, '')}`;
+        }
+      }
+    } catch (err) {
+      console.warn('Instagram embed fallback error:', err);
+    }
   }
 
-  const cleanTitle = (title || (isReel ? 'Instagram_Reel' : 'Instagram_Post')).slice(0, 45);
+  // Proxy thumbnail through our local backend so Instagram's Cross-Origin-Resource-Policy header never blocks <img> rendering
+  const fallbackCover = 'https://images.unsplash.com/photo-1611262588024-d12430b98920?w=800&auto=format&fit=crop&q=80';
+  const displayThumbnail = rawThumbnail
+    ? `/api/download?url=${encodeURIComponent(rawThumbnail)}&type=image&filename=thumbnail.jpeg&platform=instagram&inline=1`
+    : fallbackCover;
+
+  const cleanTitle = (title || (isReel ? 'Instagram_Reel' : 'Instagram_Post'))
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .slice(0, 45);
 
   const qualities: QualityOptionItem[] = [
     {
@@ -372,27 +463,27 @@ async function extractInstagram(url: string) {
       format: 'mp4' as const,
       type: 'video' as const,
       size: '~12 MB',
-      url: `/api/download?url=${encodeURIComponent(videoUrl || thumbnail)}&filename=${encodeURIComponent(cleanTitle + '.mp4')}&platform=instagram`,
+      url: `/api/download?url=${encodeURIComponent(canonicalUrl)}&type=video&quality=1080&filename=${encodeURIComponent(cleanTitle + '.mp4')}&platform=instagram`,
+      hasWatermark: false,
+    },
+    {
+      id: 'ig-image-jpeg',
+      label: 'Imagem / Foto em Resolução Máxima (JPEG)',
+      resolution: 'Original 1080p',
+      format: 'jpeg' as const,
+      type: 'image' as const,
+      size: '~1.5 MB',
+      url: `/api/download?url=${encodeURIComponent(imageUrl || rawThumbnail || canonicalUrl)}&type=image&filename=${encodeURIComponent(cleanTitle + '.jpeg')}&platform=instagram`,
       hasWatermark: false,
     },
     {
       id: 'ig-audio',
-      label: 'Áudio Extraído do Post (MP3)',
+      label: 'Áudio Extraído do Reel / Vídeo (MP3)',
       resolution: 'Áudio Estéreo',
       format: 'mp3' as const,
       type: 'audio' as const,
       size: '~2.8 MB',
-      url: `/api/download?url=${encodeURIComponent(videoUrl || thumbnail)}&type=audio&filename=${encodeURIComponent(cleanTitle + '_audio.mp3')}&platform=instagram`,
-      hasWatermark: false,
-    },
-    {
-      id: 'ig-image-hd',
-      label: 'Foto / Capa em Resolução Máxima (JPG)',
-      resolution: 'Original 1080p',
-      format: 'jpg' as const,
-      type: 'image' as const,
-      size: '~1.5 MB',
-      url: `/api/download?url=${encodeURIComponent(imageUrl || thumbnail)}&filename=${encodeURIComponent(cleanTitle + '_cover.jpg')}&platform=instagram`,
+      url: `/api/download?url=${encodeURIComponent(canonicalUrl)}&type=audio&filename=${encodeURIComponent(cleanTitle + '_audio.mp3')}&platform=instagram`,
       hasWatermark: false,
     },
   ];
@@ -402,11 +493,11 @@ async function extractInstagram(url: string) {
     originalUrl: url,
     platform: 'instagram' as const,
     mediaType: isReel ? ('video' as const) : ('image' as const),
-    title: title || (isReel ? 'Instagram Reel' : 'Instagram Publicação'),
+    title,
     author,
-    thumbnail,
-    duration: isReel ? duration : undefined,
-    description: isReel ? 'Reel do Instagram processado para download.' : 'Publicação do Instagram extraída em alta definição.',
+    thumbnail: displayThumbnail,
+    duration,
+    description: isReel ? 'Reel do Instagram extraído via yt-dlp em MP4.' : 'Publicação do Instagram extraída em alta definição.',
     qualities,
   };
 }
@@ -601,14 +692,33 @@ app.get('/api/download', async (req: Request, res: Response) => {
     }
 
     let targetUrl = decodeURIComponent(url);
+    const isInline = req.query.inline === '1';
 
-    const isVideoOrAudio = filename.endsWith('.mp4') || filename.endsWith('.webm') || filename.endsWith('.mp3');
-    const isYouTubeUrl = targetUrl.includes('youtube.com/watch') || targetUrl.includes('youtu.be/') || targetUrl.includes('youtube.com/shorts');
+    const isVideoOrAudio =
+      filename.endsWith('.mp4') ||
+      filename.endsWith('.webm') ||
+      filename.endsWith('.mp3') ||
+      req.query.type === 'video' ||
+      req.query.type === 'audio';
 
-    // 1. YouTube video or audio: stream directly using yt-dlp + cookies.txt to avoid 429 Too Many Requests
-    if (isYouTubeUrl && isVideoOrAudio) {
+    const isYtDlpPlatform =
+      targetUrl.includes('youtube.com/watch') ||
+      targetUrl.includes('youtu.be/') ||
+      targetUrl.includes('youtube.com/shorts') ||
+      targetUrl.includes('instagram.com/') ||
+      targetUrl.includes('instagr.am/');
+
+    // 1. YouTube & Instagram video or audio: download & remux via yt-dlp + ffmpeg into genuine MP4/MP3
+    if (isYtDlpPlatform && isVideoOrAudio && !isInline) {
       const isAudio = filename.endsWith('.mp3') || req.query.type === 'audio';
-      const args: string[] = ['--no-warnings', '--no-playlist', '-o', '-'];
+      const ext = isAudio ? 'mp3' : 'mp4';
+      const cleanFilename = filename.replace(/\.(webm|mp4|m4a|mp3|jpeg|jpg)$/i, '') + '.' + ext;
+
+      const tempDir = fs.existsSync('/tmp') ? '/tmp' : os.tmpdir();
+      const tempPrefix = `uv-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const tempFile = path.join(tempDir, `${tempPrefix}.${ext}`);
+
+      const args: string[] = ['--no-warnings', '--no-playlist'];
 
       if (fs.existsSync(COOKIES_FILE)) {
         args.push('--cookies', COOKIES_FILE);
@@ -616,8 +726,8 @@ app.get('/api/download', async (req: Request, res: Response) => {
 
       if (isAudio) {
         args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
-        res.setHeader('Content-Type', 'audio/mpeg');
       } else {
+        // Enforce MP4 container with H.264/AAC compatibility across YouTube & Instagram Reels
         if (quality === '1080') {
           args.push('-f', 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best');
         } else if (quality === '720') {
@@ -627,36 +737,76 @@ app.get('/api/download', async (req: Request, res: Response) => {
         } else {
           args.push('-f', 'bestvideo+bestaudio/best');
         }
-        res.setHeader('Content-Type', 'video/mp4');
+        args.push('--merge-output-format', 'mp4');
+        args.push('--remux-video', 'mp4');
       }
 
+      args.push('-o', tempFile);
       args.push(targetUrl);
 
-      res.setHeader(
-        'Content-Disposition',
-        `attachment; filename="${encodeURIComponent(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`
-      );
-
       const ytdlp = spawn('yt-dlp', args);
-
-      ytdlp.stdout.pipe(res);
 
       let errOutput = '';
       ytdlp.stderr.on('data', (d) => {
         errOutput += d.toString();
       });
 
+      const cleanupTempFiles = () => {
+        try {
+          const files = fs.readdirSync(tempDir);
+          for (const f of files) {
+            if (f.startsWith(tempPrefix)) {
+              try {
+                fs.unlinkSync(path.join(tempDir, f));
+              } catch {}
+            }
+          }
+        } catch {}
+      };
+
       ytdlp.on('error', (err) => {
         console.error('[yt-dlp error]:', err.message);
+        cleanupTempFiles();
         if (!res.headersSent) {
           res.status(500).send('yt-dlp não disponível no ambiente ou falhou ao executar.');
         }
       });
 
       ytdlp.on('close', (code) => {
-        if (code !== 0 && !res.headersSent) {
-          console.error(`yt-dlp saiu com código ${code}: ${errOutput}`);
-          res.status(403).send(errOutput || 'Erro ao processar mídia com yt-dlp.');
+        let finalFile = fs.existsSync(tempFile) ? tempFile : '';
+        if (!finalFile) {
+          try {
+            const matchFile = fs.readdirSync(tempDir).find((f) => f.startsWith(tempPrefix));
+            if (matchFile) {
+              finalFile = path.join(tempDir, matchFile);
+            }
+          } catch {}
+        }
+
+        if (code === 0 && finalFile && fs.existsSync(finalFile)) {
+          const stat = fs.statSync(finalFile);
+          res.setHeader('Content-Length', stat.size);
+          res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
+          res.setHeader(
+            'Content-Disposition',
+            `attachment; filename="${encodeURIComponent(cleanFilename)}"; filename*=UTF-8''${encodeURIComponent(cleanFilename)}`
+          );
+
+          const fileStream = fs.createReadStream(finalFile);
+          fileStream.pipe(res);
+
+          fileStream.on('close', cleanupTempFiles);
+          res.on('finish', cleanupTempFiles);
+          res.on('close', cleanupTempFiles);
+        } else {
+          cleanupTempFiles();
+          if (!res.headersSent) {
+            console.error(`yt-dlp saiu com código ${code}: ${errOutput}`);
+            res.status(403).send(
+              errOutput ||
+                'Não foi possível baixar o vídeo em MP4. Verifique se os cookies do Instagram/YouTube estão salvos.'
+            );
+          }
         }
       });
 
@@ -664,40 +814,76 @@ app.get('/api/download', async (req: Request, res: Response) => {
         try {
           ytdlp.kill('SIGTERM');
         } catch {}
+        cleanupTempFiles();
       });
 
       return;
     }
 
-    // 2. Direct CDN files, thumbnails, and other media: stream directly via fetch
+    // If user requested an Instagram image (.jpeg) but targetUrl is still the post page URL, resolve its CDN image via yt-dlp
+    if (
+      (req.query.type === 'image' || filename.endsWith('.jpeg') || filename.endsWith('.jpg')) &&
+      (targetUrl.includes('instagram.com/') || targetUrl.includes('instagr.am/')) &&
+      !targetUrl.includes('cdninstagram.com') &&
+      !targetUrl.includes('fbcdn.net')
+    ) {
+      const info = await runYtDlpJson(targetUrl);
+      if (info) {
+        const resolvedImg =
+          info.thumbnail ||
+          (Array.isArray(info.thumbnails) && info.thumbnails.length > 0
+            ? info.thumbnails[info.thumbnails.length - 1].url
+            : '') ||
+          info.url;
+        if (resolvedImg) {
+          targetUrl = resolvedImg;
+        }
+      }
+    }
+
+    // 2. Direct CDN files, thumbnails (.jpeg), and other media: stream directly via fetch
     if (targetUrl.startsWith('http://') || targetUrl.startsWith('https://')) {
       const response = await fetch(targetUrl, {
         headers: {
           'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          Referer: platform === 'tiktok' ? 'https://www.tiktok.com/' : platform === 'instagram' ? 'https://www.instagram.com/' : 'https://www.google.com/',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+          Referer:
+            platform === 'tiktok'
+              ? 'https://www.tiktok.com/'
+              : platform === 'instagram'
+              ? 'https://www.instagram.com/'
+              : 'https://www.google.com/',
         },
       });
 
       if (!response.ok || !response.body) {
-        // Fallback or retry
         return res.status(response.status).send(`Falha ao obter mídia externa: ${response.statusText}`);
       }
 
-      const contentType = response.headers.get('content-type') || 'application/octet-stream';
+      let contentType = response.headers.get('content-type') || 'application/octet-stream';
       const contentLength = response.headers.get('content-length');
 
-      // Prevent serving HTML login/challenge pages as MP4/MP3 media
-      if (contentType.includes('text/html') && (filename.endsWith('.mp4') || filename.endsWith('.mp3'))) {
+      // Prevent serving HTML login/challenge pages as media
+      if (
+        contentType.includes('text/html') &&
+        (filename.endsWith('.mp4') || filename.endsWith('.mp3') || filename.endsWith('.jpeg') || filename.endsWith('.jpg'))
+      ) {
         return res
           .status(403)
-          .send('A plataforma exigiu autenticação adicional para este arquivo de vídeo no servidor em nuvem.');
+          .send('A plataforma exigiu autenticação adicional. Salve os cookies da conta na aba Homelab.');
       }
 
+      if (filename.endsWith('.jpeg') || filename.endsWith('.jpg') || req.query.type === 'image') {
+        contentType = 'image/jpeg';
+      }
+
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       res.setHeader('Content-Type', contentType);
       res.setHeader(
         'Content-Disposition',
-        `attachment; filename="${encodeURIComponent(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`
+        isInline
+          ? 'inline'
+          : `attachment; filename="${encodeURIComponent(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`
       );
       if (contentLength) {
         res.setHeader('Content-Length', contentLength);

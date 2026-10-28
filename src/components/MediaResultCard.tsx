@@ -33,6 +33,7 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
   const [copiedLink, setCopiedLink] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'all' | 'video' | 'audio' | 'image'>('all');
+  const [imgError, setImgError] = useState(false);
 
   const filteredQualities = media.qualities.filter((q) => {
     if (activeTab === 'all') return true;
@@ -222,11 +223,12 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
         <div className="p-6 grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
           {/* Thumbnail preview */}
           <div className="md:col-span-5 relative group rounded-xl overflow-hidden bg-slate-950 aspect-video md:aspect-square flex items-center justify-center border border-slate-800">
-            {media.thumbnail ? (
+            {media.thumbnail && !imgError ? (
               <img
                 src={media.thumbnail}
                 alt={media.title}
                 referrerPolicy="no-referrer"
+                onError={() => setImgError(true)}
                 className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
               />
             ) : (

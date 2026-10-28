@@ -1,6 +1,6 @@
 {
-  "summary":  "Plano de implementação para o OmniSnap Media Downloader (alternativa self-hosted/homelab ao SnapInsta para YouTube, Instagram, TikTok e Pinterest com histórico persistente e seleção de qualidade).",
-  "updatedAt":  "2026-10-27T22:21:28.577280286Z",
+  "summary":  "Plano de implementacao para corrigir a extracao e o download de Reels, videos (.mp4) e imagens (.jpeg) do Instagram usando yt-dlp com suporte a cookies.txt e proxy de thumbnail.",
+  "updatedAt":  "2026-10-28T16:40:53.343868651Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

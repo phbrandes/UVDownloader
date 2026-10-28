@@ -6,7 +6,7 @@ export interface QualityOption {
   id: string;
   label: string;
   resolution?: string;
-  format: 'mp4' | 'mp3' | 'jpg' | 'png' | 'webp';
+  format: 'mp4' | 'mp3' | 'jpg' | 'jpeg' | 'png' | 'webp';
   type: 'video' | 'audio' | 'image';
   size?: string;
   url: string;
