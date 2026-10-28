@@ -2,11 +2,14 @@ services:
   uv-downloader:
     build: .
     container_name: uv-downloader
+    hostname: uv-downloader
     ports:
       - "3000:3000"
     environment:
       - NODE_ENV=production
       - PORT=3000
+      - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:-}
+      - CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
     volumes:
       - ./data:/app/data
     restart: unless-stopped

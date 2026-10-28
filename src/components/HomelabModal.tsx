@@ -14,9 +14,22 @@ import {
   Trash2,
   HelpCircle,
   CheckCircle2,
+  Globe,
+  ExternalLink,
+  QrCode,
+  Sparkles,
+  Power,
+  RefreshCw,
 } from 'lucide-react';
-import { ServerInfo, CookiesInfo } from '../types';
-import { fetchCookiesInfo, saveCookiesContent, deleteCookiesFile } from '../services/api';
+import { ServerInfo, CookiesInfo, TunnelInfo } from '../types';
+import {
+  fetchCookiesInfo,
+  saveCookiesContent,
+  deleteCookiesFile,
+  fetchTunnelInfo,
+  saveTunnelConfig,
+  stopCloudflareTunnel,
+} from '../services/api';
 
 interface HomelabModalProps {
   isOpen: boolean;
@@ -29,9 +42,10 @@ export const HomelabModal: React.FC<HomelabModalProps> = ({
   onClose,
   serverInfo,
 }) => {
-  const [activeTab, setActiveTab] = useState<'server' | 'cookies'>('server');
+  const [activeTab, setActiveTab] = useState<'cloudflare' | 'cookies' | 'server'>('cloudflare');
   const [copiedDocker, setCopiedDocker] = useState(false);
   const [copiedCommand, setCopiedCommand] = useState(false);
+  const [copiedDomain, setCopiedDomain] = useState(false);
 
   // Cookies state
   const [cookiesInfo, setCookiesInfo] = useState<CookiesInfo | null>(null);
@@ -39,44 +53,67 @@ export const HomelabModal: React.FC<HomelabModalProps> = ({
   const [isSavingCookies, setIsSavingCookies] = useState(false);
   const [cookieFeedback, setCookieFeedback] = useState<string | null>(null);
 
+  // Cloudflare Tunnel state
+  const [tunnelInfo, setTunnelInfo] = useState<TunnelInfo | null>(null);
+  const [domainInput, setDomainInput] = useState('');
+  const [tokenInput, setTokenInput] = useState('');
+  const [isSavingTunnel, setIsSavingTunnel] = useState(false);
+  const [tunnelFeedback, setTunnelFeedback] = useState<string | null>(null);
+
   useEffect(() => {
     if (isOpen) {
       fetchCookiesInfo().then((info) => setCookiesInfo(info));
+      fetchTunnelInfo().then((info) => {
+        setTunnelInfo(info);
+        if (info.publicDomain) {
+          setDomainInput(info.publicDomain);
+        }
+      });
     }
   }, [isOpen]);
 
+  // Poll tunnel status while starting
+  useEffect(() => {
+    if (!isOpen || !tunnelInfo || tunnelInfo.status !== 'starting') return;
+    const timer = setInterval(async () => {
+      const updated = await fetchTunnelInfo();
+      setTunnelInfo(updated);
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [isOpen, tunnelInfo?.status]);
+
   if (!isOpen) return null;
 
-  const dockerComposeSnippet = `version: "3.8"
-services:
+  const dockerComposeSnippet = `services:
   uv-downloader:
-    image: uv-downloader:latest
+    build: .
     container_name: uv-downloader
+    hostname: uv-downloader
     ports:
       - "3000:3000"
     environment:
       - NODE_ENV=production
       - PORT=3000
+      - PUBLIC_DOMAIN=\${PUBLIC_DOMAIN:-}
+      - CLOUDFLARE_TUNNEL_TOKEN=\${CLOUDFLARE_TUNNEL_TOKEN:-}
     volumes:
       - ./data:/app/data
     restart: unless-stopped`;
 
-  const dockerRunSnippet = `docker run -d \\
-  --name uv-downloader \\
-  -p 3000:3000 \\
-  -v $(pwd)/data:/app/data \\
-  --restart unless-stopped \\
-  uv-downloader:latest`;
+  const dockerRunSnippet = `docker compose up -d --build`;
 
-  const handleCopy = (text: string, type: 'compose' | 'command') => {
+  const handleCopy = (text: string, type: 'compose' | 'command' | 'domain') => {
     if (navigator.clipboard) {
       navigator.clipboard.writeText(text);
       if (type === 'compose') {
         setCopiedDocker(true);
         setTimeout(() => setCopiedDocker(false), 2000);
-      } else {
+      } else if (type === 'command') {
         setCopiedCommand(true);
         setTimeout(() => setCopiedCommand(false), 2000);
+      } else {
+        setCopiedDomain(true);
+        setTimeout(() => setCopiedDomain(false), 2000);
       }
     }
   };
@@ -98,12 +135,66 @@ services:
   };
 
   const handleDeleteCookies = async () => {
-    if (confirm('Deseja realmente remover o arquivo cookies.txt do servidor?')) {
-      await deleteCookiesFile();
-      setCookiesInfo({ exists: false, domains: [] });
-      setCookieFeedback('Arquivo cookies.txt removido.');
-      setTimeout(() => setCookieFeedback(null), 3000);
+    await deleteCookiesFile();
+    setCookiesInfo({ exists: false, domains: [] });
+    setCookieFeedback('Arquivo cookies.txt removido.');
+    setTimeout(() => setCookieFeedback(null), 3000);
+  };
+
+  const handleSaveCustomTunnel = async () => {
+    setIsSavingTunnel(true);
+    setTunnelFeedback(null);
+    try {
+      const updated = await saveTunnelConfig({
+        mode: 'custom',
+        publicDomain: domainInput.trim(),
+        tunnelToken: tokenInput.trim() || undefined,
+      });
+      setTunnelInfo(updated);
+      setTokenInput('');
+      setTunnelFeedback('Túnel Cloudflare Zero Trust salvo e iniciado com sucesso!');
+      setTimeout(() => setTunnelFeedback(null), 4000);
+    } catch (err: any) {
+      setTunnelFeedback('Erro: ' + err.message);
+    } finally {
+      setIsSavingTunnel(false);
     }
+  };
+
+  const handleStartQuickTunnel = async () => {
+    setIsSavingTunnel(true);
+    setTunnelFeedback(null);
+    try {
+      const updated = await saveTunnelConfig({
+        mode: 'quick',
+      });
+      setTunnelInfo(updated);
+      setTunnelFeedback('Túnel HTTPS gratuito iniciado! Aguarde alguns segundos se o link ainda estiver gerando.');
+      setTimeout(() => setTunnelFeedback(null), 4000);
+    } catch (err: any) {
+      setTunnelFeedback('Erro: ' + err.message);
+    } finally {
+      setIsSavingTunnel(false);
+    }
+  };
+
+  const handleStopTunnel = async () => {
+    setIsSavingTunnel(true);
+    try {
+      const updated = await stopCloudflareTunnel();
+      setTunnelInfo(updated);
+      setTunnelFeedback('Túnel remoto desligado.');
+      setTimeout(() => setTunnelFeedback(null), 3000);
+    } catch (err: any) {
+      setTunnelFeedback('Erro ao desligar túnel: ' + err.message);
+    } finally {
+      setIsSavingTunnel(false);
+    }
+  };
+
+  const handleRefreshTunnel = async () => {
+    const updated = await fetchTunnelInfo();
+    setTunnelInfo(updated);
   };
 
   const formatUptime = (seconds?: number) => {
@@ -116,6 +207,13 @@ services:
     return `${secs}s`;
   };
 
+  const activeRemoteUrl =
+    tunnelInfo?.mode === 'custom'
+      ? tunnelInfo.publicDomain
+      : tunnelInfo?.mode === 'quick'
+      ? tunnelInfo.quickTunnelUrl
+      : '';
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
       <div className="relative w-full max-w-2xl bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 shadow-2xl overflow-hidden max-h-[90vh] flex flex-col">
@@ -126,8 +224,8 @@ services:
               <Server className="w-4 h-4" />
             </div>
             <div>
-              <h3 className="text-base font-bold text-white">Configurações do Homelab & yt-dlp</h3>
-              <p className="text-xs text-slate-400">Servidor self-hosted e autenticação com cookies</p>
+              <h3 className="text-base font-bold text-white">Configurações do Homelab & Acesso Online</h3>
+              <p className="text-xs text-slate-400">Domínio Cloudflare, autenticação yt-dlp e métricas do container</p>
             </div>
           </div>
 
@@ -140,18 +238,22 @@ services:
         </div>
 
         {/* Navigation Tabs */}
-        <div className="flex items-center gap-2 pt-4 pb-2 border-b border-slate-800/80">
+        <div className="flex flex-wrap items-center gap-2 pt-4 pb-2 border-b border-slate-800/80">
           <button
-            onClick={() => setActiveTab('server')}
+            onClick={() => setActiveTab('cloudflare')}
             className={`flex items-center gap-2 px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors ${
-              activeTab === 'server'
+              activeTab === 'cloudflare'
                 ? 'bg-slate-800 text-white shadow-sm border border-slate-700'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            <Terminal className="w-3.5 h-3.5" />
-            <span>Servidor & Docker</span>
+            <Globe className="w-3.5 h-3.5 text-sky-400" />
+            <span>Domínio & Cloudflare</span>
+            {tunnelInfo?.status === 'connected' && (
+              <span className="w-2 h-2 rounded-full bg-emerald-400" />
+            )}
           </button>
+
           <button
             onClick={() => setActiveTab('cookies')}
             className={`flex items-center gap-2 px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors ${
@@ -166,120 +268,247 @@ services:
               <span className="w-2 h-2 rounded-full bg-emerald-400" />
             )}
           </button>
+
+          <button
+            onClick={() => setActiveTab('server')}
+            className={`flex items-center gap-2 px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors ${
+              activeTab === 'server'
+                ? 'bg-slate-800 text-white shadow-sm border border-slate-700'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Terminal className="w-3.5 h-3.5 text-indigo-400" />
+            <span>Servidor & Docker</span>
+          </button>
         </div>
 
         {/* Content */}
         <div className="overflow-y-auto py-4 space-y-6 pr-1 flex-1">
-          {activeTab === 'server' ? (
-            <>
-              {/* Server status cards */}
-              <div>
-                <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-3">
-                  Métricas do Servidor Atual
-                </h4>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  <div className="p-3 bg-slate-950/80 border border-slate-800/80 rounded-xl">
-                    <div className="flex items-center gap-1.5 text-xs text-slate-400 mb-1">
-                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>Status</span>
-                    </div>
-                    <div className="text-sm font-semibold text-emerald-400 capitalize">
-                      {serverInfo?.status || 'Online'}
-                    </div>
-                  </div>
-
-                  <div className="p-3 bg-slate-950/80 border border-slate-800/80 rounded-xl">
-                    <div className="flex items-center gap-1.5 text-xs text-slate-400 mb-1">
-                      <Clock className="w-3.5 h-3.5 text-sky-400" />
-                      <span>Uptime</span>
-                    </div>
-                    <div className="text-sm font-semibold text-white font-mono tabular-nums">
-                      {formatUptime(serverInfo?.uptime)}
+          {activeTab === 'cloudflare' && (
+            <div className="space-y-5">
+              {/* Tunnel Active Status Banner */}
+              <div className="p-4 bg-slate-950/90 border border-slate-800 rounded-xl space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5">
+                    <Globe className="w-4 h-4 text-sky-400 shrink-0" />
+                    <div>
+                      <div className="text-sm font-semibold text-white">Status do Acesso Remoto (Cloudflare Tunnel)</div>
+                      <div className="text-xs text-slate-400">
+                        {tunnelInfo?.status === 'connected'
+                          ? tunnelInfo.mode === 'custom'
+                            ? 'Conectado via Conta Cloudflare Zero Trust (Domínio Fixo)'
+                            : 'Conectado via Túnel HTTPS Gratuito (TryCloudflare)'
+                          : tunnelInfo?.status === 'starting'
+                          ? 'Iniciando conexão com a rede da Cloudflare...'
+                          : tunnelInfo?.status === 'error'
+                          ? tunnelInfo.lastError || 'Erro ao conectar túnel'
+                          : 'Túnel remoto desligado no momento'}
+                      </div>
                     </div>
                   </div>
 
-                  <div className="p-3 bg-slate-950/80 border border-slate-800/80 rounded-xl">
-                    <div className="flex items-center gap-1.5 text-xs text-slate-400 mb-1">
-                      <Cpu className="w-3.5 h-3.5 text-indigo-400" />
-                      <span>Memória RAM</span>
-                    </div>
-                    <div className="text-sm font-semibold text-white font-mono tabular-nums">
-                      {serverInfo?.memoryUsage?.heapUsed || '32.4 MB'}
-                    </div>
-                  </div>
-
-                  <div className="p-3 bg-slate-950/80 border border-slate-800/80 rounded-xl">
-                    <div className="flex items-center gap-1.5 text-xs text-slate-400 mb-1">
-                      <HardDrive className="w-3.5 h-3.5 text-amber-400" />
-                      <span>Downloads</span>
-                    </div>
-                    <div className="text-sm font-semibold text-white font-mono tabular-nums">
-                      {serverInfo?.historyCount || 0} itens
-                    </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      onClick={handleRefreshTunnel}
+                      className="p-1.5 text-slate-400 hover:text-white bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-lg transition-colors"
+                      title="Atualizar status"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    </button>
+                    {tunnelInfo?.mode !== 'off' && (
+                      <button
+                        onClick={handleStopTunnel}
+                        disabled={isSavingTunnel}
+                        className="flex items-center gap-1 px-2.5 py-1 text-xs text-rose-400 hover:text-rose-300 bg-rose-950/30 hover:bg-rose-950/50 border border-rose-900/50 rounded-lg transition-colors"
+                      >
+                        <Power className="w-3 h-3" />
+                        <span>Desligar</span>
+                      </button>
+                    )}
                   </div>
                 </div>
+
+                {/* Active URL + QR Code when available */}
+                {activeRemoteUrl && (
+                  <div className="pt-3 border-t border-slate-800/80 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                    <div className="space-y-2 flex-1 min-w-0">
+                      <div className="text-[11px] font-semibold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>Seu Link Online para Celular e Outros PCs:</span>
+                      </div>
+                      <div className="p-2.5 bg-slate-900 border border-slate-800 rounded-lg font-mono text-xs text-sky-300 break-all">
+                        {activeRemoteUrl}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          onClick={() => handleCopy(activeRemoteUrl, 'domain')}
+                          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-sky-600 hover:bg-sky-500 rounded-lg transition-colors"
+                        >
+                          {copiedDomain ? (
+                            <>
+                              <Check className="w-3.5 h-3.5" />
+                              <span>Link Copiado!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3.5 h-3.5" />
+                              <span>Copiar Endereço</span>
+                            </>
+                          )}
+                        </button>
+                        <a
+                          href={activeRemoteUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                          <span>Testar Link</span>
+                        </a>
+                      </div>
+                    </div>
+
+                    {/* QR Code for instant mobile scan */}
+                    <div className="flex flex-col items-center p-2.5 bg-white rounded-xl shrink-0 self-center sm:self-auto">
+                      <img
+                        src={`https://api.qrserver.com/v1/create-qr-code/?size=110x110&data=${encodeURIComponent(
+                          activeRemoteUrl
+                        )}`}
+                        alt="QR Code de Acesso Remoto"
+                        className="w-24 h-24 rounded"
+                      />
+                      <span className="text-[10px] font-semibold text-slate-800 mt-1 flex items-center gap-1">
+                        <QrCode className="w-3 h-3" />
+                        Abrir no Celular
+                      </span>
+                    </div>
+                  </div>
+                )}
               </div>
 
-              {/* Docker Compose Configuration */}
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <div className="flex items-center gap-2">
-                    <Terminal className="w-4 h-4 text-sky-400" />
-                    <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider">
-                      docker-compose.yml (Recomendado para Homelab)
+              {tunnelFeedback && (
+                <div className="p-2.5 bg-sky-950/60 border border-sky-800/60 text-sky-200 text-xs rounded-lg">
+                  {tunnelFeedback}
+                </div>
+              )}
+
+              {/* Option 1: Custom Domain via Cloudflare Zero Trust Account */}
+              <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h4 className="text-xs font-bold text-white uppercase tracking-wider">
+                      1. Configurar Domínio Fixo na sua Conta Cloudflare (Zero Trust)
                     </h4>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Use um domínio da sua conta Cloudflare (ex.: <code className="text-sky-300">uvdownloader.com</code>) para entrar sem digitar IP.
+                    </p>
                   </div>
-                  <button
-                    onClick={() => handleCopy(dockerComposeSnippet, 'compose')}
-                    className="flex items-center gap-1 px-2.5 py-1 text-xs text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-750 border border-slate-700 rounded-lg transition-colors"
-                  >
-                    {copiedDocker ? (
-                      <>
-                        <Check className="w-3 h-3 text-emerald-400" />
-                        <span className="text-emerald-400">Copiado</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-3 h-3" />
-                        <span>Copiar Compose</span>
-                      </>
-                    )}
-                  </button>
+                  {tunnelInfo?.hasToken && (
+                    <span className="text-[11px] font-medium text-emerald-400 bg-emerald-950/50 border border-emerald-800/50 px-2 py-0.5 rounded">
+                      Token Salvo
+                    </span>
+                  )}
                 </div>
-                <pre className="p-3.5 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-slate-300 overflow-x-auto leading-relaxed">
-                  {dockerComposeSnippet}
-                </pre>
+
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 mb-1">
+                      Seu Domínio Personalizado (ex.: https://uvdownloader.com)
+                    </label>
+                    <input
+                      type="text"
+                      value={domainInput}
+                      onChange={(e) => setDomainInput(e.target.value)}
+                      placeholder="https://uvdownloader.com"
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-white placeholder-slate-600 focus:outline-none focus:border-sky-500 font-mono"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 mb-1">
+                      Token do Túnel Cloudflare (ou cole o comando completo da Cloudflare)
+                    </label>
+                    <input
+                      type="password"
+                      value={tokenInput}
+                      onChange={(e) => setTokenInput(e.target.value)}
+                      placeholder={
+                        tunnelInfo?.hasToken
+                          ? '•••••••••••••••••••••••• (Token já salvo — cole outro apenas se quiser trocar)'
+                          : 'Cole aqui: eyJhIjoi... ou docker run cloudflare/cloudflared ... --token eyJ...'
+                      }
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-white placeholder-slate-600 focus:outline-none focus:border-sky-500 font-mono"
+                    />
+                    <p className="text-[11px] text-slate-500 mt-1">
+                      Você pode colar o comando inteiro que aparece na Cloudflare — o sistema extrai o código <code className="text-slate-400">eyJ...</code> automaticamente.
+                    </p>
+                  </div>
+
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      onClick={handleSaveCustomTunnel}
+                      disabled={isSavingTunnel || (!tokenInput.trim() && !tunnelInfo?.hasToken)}
+                      className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-sky-600 hover:bg-sky-500 disabled:opacity-50 rounded-lg transition-colors"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span>Salvar e Ativar Meu Domínio</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Step-by-step instructions for Cloudflare Zero Trust Dashboard */}
+                <div className="p-3.5 bg-slate-900/70 border border-slate-800/80 rounded-xl space-y-2 text-xs text-slate-400">
+                  <div className="font-semibold text-slate-200 flex items-center gap-1.5">
+                    <HelpCircle className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Quais botões apertar no painel da sua conta Cloudflare:</span>
+                  </div>
+                  <ol className="list-decimal pl-4 space-y-1.5 leading-relaxed">
+                    <li>
+                      Entre na sua conta em <strong className="text-slate-200">one.dash.cloudflare.com</strong> (Cloudflare Zero Trust) e no menu lateral clique em <strong className="text-slate-200">Networks</strong> &rarr; <strong className="text-slate-200">Tunnels</strong>.
+                    </li>
+                    <li>
+                      Clique no botão azul <strong className="text-slate-200">Create a tunnel</strong>, selecione a opção <strong className="text-slate-200">Cloudflared</strong>, digite o nome <code className="text-sky-300">uv-downloader</code> e clique em <strong className="text-slate-200">Save tunnel</strong>.
+                    </li>
+                    <li>
+                      Na tela <strong className="text-slate-200">Install and run a connector</strong>, clique no botão de copiar o comando (que termina com um código longo começando com <code className="text-sky-300">eyJ...</code>) e cole no campo de Token acima.
+                    </li>
+                    <li>
+                      Lá na Cloudflare, clique em <strong className="text-slate-200">Next</strong> (aba <strong className="text-slate-200">Public Hostname</strong>):
+                      <ul className="list-disc pl-4 mt-1 space-y-0.5 text-slate-300">
+                        <li>Em <strong>Domain</strong>: escolha o seu domínio cadastrado na Cloudflare (ex.: <code>uvdownloader.com</code>).</li>
+                        <li>Em <strong>Service Type</strong>: escolha <code>HTTP</code>.</li>
+                        <li>Em <strong>URL</strong>: digite <code>localhost:3000</code> e clique em <strong>Save tunnel</strong>.</li>
+                      </ul>
+                    </li>
+                  </ol>
+                </div>
               </div>
 
-              {/* Docker Run Single Line */}
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider">
-                    Comando Docker CLI Rápido
-                  </h4>
-                  <button
-                    onClick={() => handleCopy(dockerRunSnippet, 'command')}
-                    className="flex items-center gap-1 px-2.5 py-1 text-xs text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-750 border border-slate-700 rounded-lg transition-colors"
-                  >
-                    {copiedCommand ? (
-                      <>
-                        <Check className="w-3 h-3 text-emerald-400" />
-                        <span className="text-emerald-400">Copiado</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-3 h-3" />
-                        <span>Copiar CLI</span>
-                      </>
-                    )}
-                  </button>
+              {/* Option 2: Instant Free HTTPS Link without owning a paid domain */}
+              <div className="p-4 bg-slate-950/40 border border-slate-800/70 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-200">
+                    <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Ainda não comprou um domínio .com na Cloudflare?</span>
+                  </div>
+                  <p className="text-xs text-slate-400">
+                    Gere um endereço HTTPS gratuito instantâneo da Cloudflare (<code className="text-slate-300">https://...trycloudflare.com</code>) com 1 clique para usar no celular agora mesmo.
+                  </p>
                 </div>
-                <pre className="p-3.5 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-slate-300 overflow-x-auto leading-relaxed">
-                  {dockerRunSnippet}
-                </pre>
+                <button
+                  type="button"
+                  onClick={handleStartQuickTunnel}
+                  disabled={isSavingTunnel}
+                  className="px-3.5 py-2 text-xs font-semibold text-slate-200 hover:text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors shrink-0"
+                >
+                  Gerar Link Gratuito
+                </button>
               </div>
-            </>
-          ) : (
+            </div>
+          )}
+
+          {activeTab === 'cookies' && (
             /* Cookies Tab */
             <div className="space-y-5">
               {/* Status Card */}
@@ -348,7 +577,7 @@ services:
                 />
                 <div className="flex justify-between items-center mt-2">
                   <span className="text-[11px] text-slate-500">
-                    Ou coloque o arquivo diretamente em <code className="text-sky-300">./data/cookies.txt</code>
+                    Salvo de forma persistente em <code className="text-sky-300">./data/cookies.txt</code>
                   </span>
                   <button
                     type="button"
@@ -382,11 +611,119 @@ services:
                     Cole o texto no campo acima e clique em <strong className="text-slate-300">"Salvar no Homelab"</strong>.
                   </li>
                 </ol>
-                <p className="text-[11px] text-slate-500 pt-1">
-                  O yt-dlp utilizará automaticamente o parâmetro <code className="text-sky-400">--cookies /app/data/cookies.txt</code> para liberar vídeos +18, membros ou feeds com login obrigatório.
-                </p>
               </div>
             </div>
+          )}
+
+          {activeTab === 'server' && (
+            <>
+              {/* Server status cards */}
+              <div>
+                <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-3">
+                  Métricas do Servidor Atual
+                </h4>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <div className="p-3 bg-slate-950/80 border border-slate-800/80 rounded-xl">
+                    <div className="flex items-center gap-1.5 text-xs text-slate-400 mb-1">
+                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Status</span>
+                    </div>
+                    <div className="text-sm font-semibold text-emerald-400 capitalize">
+                      {serverInfo?.status || 'Online'}
+                    </div>
+                  </div>
+
+                  <div className="p-3 bg-slate-950/80 border border-slate-800/80 rounded-xl">
+                    <div className="flex items-center gap-1.5 text-xs text-slate-400 mb-1">
+                      <Clock className="w-3.5 h-3.5 text-sky-400" />
+                      <span>Uptime</span>
+                    </div>
+                    <div className="text-sm font-semibold text-white font-mono tabular-nums">
+                      {formatUptime(serverInfo?.uptime)}
+                    </div>
+                  </div>
+
+                  <div className="p-3 bg-slate-950/80 border border-slate-800/80 rounded-xl">
+                    <div className="flex items-center gap-1.5 text-xs text-slate-400 mb-1">
+                      <Cpu className="w-3.5 h-3.5 text-indigo-400" />
+                      <span>Memória RAM</span>
+                    </div>
+                    <div className="text-sm font-semibold text-white font-mono tabular-nums">
+                      {serverInfo?.memoryUsage?.heapUsed || '32.4 MB'}
+                    </div>
+                  </div>
+
+                  <div className="p-3 bg-slate-950/80 border border-slate-800/80 rounded-xl">
+                    <div className="flex items-center gap-1.5 text-xs text-slate-400 mb-1">
+                      <HardDrive className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Histórico Salvo</span>
+                    </div>
+                    <div className="text-sm font-semibold text-white font-mono tabular-nums">
+                      {serverInfo?.historyCount || 0} itens
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Docker Compose Configuration */}
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    <Terminal className="w-4 h-4 text-sky-400" />
+                    <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider">
+                      docker-compose.yml (Persistência em ./data)
+                    </h4>
+                  </div>
+                  <button
+                    onClick={() => handleCopy(dockerComposeSnippet, 'compose')}
+                    className="flex items-center gap-1 px-2.5 py-1 text-xs text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-750 border border-slate-700 rounded-lg transition-colors"
+                  >
+                    {copiedDocker ? (
+                      <>
+                        <Check className="w-3 h-3 text-emerald-400" />
+                        <span className="text-emerald-400">Copiado</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3 h-3" />
+                        <span>Copiar Compose</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+                <pre className="p-3.5 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-slate-300 overflow-x-auto leading-relaxed">
+                  {dockerComposeSnippet}
+                </pre>
+              </div>
+
+              {/* Docker Update Command */}
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider">
+                    Comando para Atualizar e Subir Container
+                  </h4>
+                  <button
+                    onClick={() => handleCopy(dockerRunSnippet, 'command')}
+                    className="flex items-center gap-1 px-2.5 py-1 text-xs text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-750 border border-slate-700 rounded-lg transition-colors"
+                  >
+                    {copiedCommand ? (
+                      <>
+                        <Check className="w-3 h-3 text-emerald-400" />
+                        <span className="text-emerald-400">Copiado</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3 h-3" />
+                        <span>Copiar Comando</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+                <pre className="p-3.5 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-slate-300 overflow-x-auto leading-relaxed">
+                  {dockerRunSnippet}
+                </pre>
+              </div>
+            </>
           )}
         </div>
 

@@ -1,77 +1,32 @@
-# Correção do Erro `Requested format is not available` no YouTube (MP4 + Cookies Inteligentes)
+# Plano Atualizado: Domínio Próprio com Conta Cloudflare + Persistência Permanente do Histórico
 
-Este plano resolve o erro `ERROR: [youtube] YIow9ta6GiM: Requested format is not available` ao baixar vídeos do YouTube, mantendo o funcionamento perfeito já alcançado no Instagram e no TikTok.
+## 1. Domínio Fixo Personalizado via Conta Cloudflare (Cloudflare Zero Trust Tunnel)
+Como você já possui uma conta na Cloudflare e deseja acessar por um endereço fixo (como `uvdownloader.com` ou `uv.seudominio.com`) sem nunca digitar IP e sem o link mudar ao reiniciar:
 
----
-
-### User Review & Critical Decisions
-
-> [!IMPORTANT]
-> O diagnóstico abaixo explica exatamente por que o erro aconteceu no YouTube após as últimas mudanças e como o motor será ajustado para nunca falhar.
-
-- **Causa Raiz 1 — Conflito de Clientes do YouTube ao Forçar Cookies em Vídeos Públicos**:
-  Quando o `yt-dlp` recebe `--cookies` em um vídeo público comum do YouTube (`YIow9ta6GiM`), ele **desativa automaticamente os clientes móveis internos (`ios`, `android_vr`)** — que são os clientes que fornecem todos os streams MP4 sem bloqueio — e força o uso apenas do cliente `web`. Sem um interpretador JS configurado para resolver o desafio `n-sig` da sessão logada, o YouTube retorna apenas imagens de storyboard e oculta os fluxos de vídeo, causando o erro `Requested format is not available`.
-- **Causa Raiz 2 — Filtro Rígido `-f bestvideo[height<=...]` vs. Ordenação Flexível `-S`**:
-  Usar filtros rígidos como `bestvideo[height<=720]` falha quando um vídeo é vertical (onde a altura é 1920 e a largura é 1080) ou quando o YouTube disponibiliza apenas fluxos pré-mesclados. Substituir o filtro rígido por `-f "bv*+ba/b"` combinado com ordenação `-S "res:1080,ext:mp4:m4a,vcodec:h264,acodec:aac"` garante que o `yt-dlp` sempre encontre o melhor formato `.mp4` disponível sem jamais abortar com erro.
+- **Integração no `docker-compose.yml` com `TUNNEL_TOKEN`:**
+  - Configuraremos o serviço oficial `cloudflared` no `docker-compose.yml` no modo **Zero Trust Named Tunnel** (`tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}`).
+  - Criaremos o suporte ao arquivo `.env` (e `.env.example`) onde você cola o `CLOUDFLARE_TUNNEL_TOKEN` da sua conta Cloudflare e o seu `PUBLIC_DOMAIN` (ex.: `https://uvdownloader.com`).
+- **Aba "Domínio & Cloudflare" no Modal Configurar Homelab (`HomelabModal.tsx`):**
+  - Exibirá o seu endereço fixo configurado (com **QR Code** para escanear com o celular e botão de copiar).
+  - Incluirá o passo a passo direto de **3 passos no painel Cloudflare Zero Trust** (`Networks -> Tunnels`) apontando o seu domínio para `http://uv-downloader:3000` (nome do container na rede interna do Docker).
+  - Permitirá salvar/atualizar o endereço do seu domínio personalizado diretamente pela interface para ficar salvo no seu painel.
 
 ---
 
-### 1. Overview & Core Concept
+## 2. Persistência Permanente do Histórico de Downloads (`./data/history.json`)
+Você tem toda razão: o histórico **deve persistir para sempre** entre sessões, reinicializações do PC e atualizações do container.
 
-- **O Que Esta Correção Faz**:
-  1. **Seleção Resiliente de Formato MP4 (`-f "bv*+ba/b" -S "res:...,ext:mp4:m4a"`)**: Em vez de exigir um filtro estrito que pode falhar, instrui o `yt-dlp` a ordenar os formatos priorizando streams nativos `.mp4` (H.264 + AAC/M4A) na resolução escolhida (`1080p`, `720p`, `480p`) e empacotar tudo em `.mp4` via FFmpeg.
-  2. **Estratégia Inteligente de Cookies (Tentativa Direta + Fallback com Cookies + Runtime Node)**:
-     - No **Instagram**: Continua usando `cookies.txt` diretamente (pois o Instagram exige sessão na maioria dos Reels).
-     - No **YouTube**: Tenta primeiro a extração padrão (que libera os clientes de alta velocidade `ios`/`android_vr` sem bloqueio) e, caso o vídeo exija login ou verificação de idade (+18), reexecuta automaticamente passando `--cookies /app/data/cookies.txt` para concluir o download.
-  3. **Limpeza Automática de Anexos Temporários**: Remove os novos prints salvos automaticamente em `/public/assets` para manter o repositório limpo.
-
----
-
-### 2. User Experience & Visual Design
-
-- **Fluxo Transparente**:
-  1. O usuário cola qualquer link do YouTube (`youtu.be/YIow9ta6GiM` ou vídeos com restrição de idade) e clica em **Baixar** em `1080p`, `720p`, `480p` ou `MP3`.
-  2. O backend seleciona o melhor stream compatível e entrega o arquivo `.mp4` (ou `.mp3`) sem exibir o erro `Requested format is not available`.
-  3. Caso um vídeo do YouTube seja restrito (+18), o fallback com `cookies.txt` entra em ação automaticamente nos bastidores, sem que o usuário precise clicar duas vezes.
+- **Por que houve conflito antes:**
+  - O arquivo `data/history.json` estava sendo rastreado pelo Git como se fosse um arquivo de código. Por isso, quando você baixava vídeos no seu PC (alterando o seu `data/history.json` local) e tentava dar `git pull`, o Git dava erro de conflito ou sobrescrevia o seu histórico com o arquivo do GitHub.
+- **Como vamos resolver definitivamente:**
+  - **Persistência no Volume Docker (`./data:/app/data`):** O `server.ts` continuará salvando todos os vídeos baixados em `./data/history.json` no disco do seu CachyOS, mantendo seu histórico intacto mesmo se você fechar o navegador, reiniciar o container ou desligar o PC.
+  - **Proteção no `.gitignore`:** Colocaremos `data/history.json` e `data/settings.json` no `.gitignore` (assim como já fizemos com `data/cookies.txt`). Dessa forma, o seu histórico local **nunca será apagado ou sobrescrito** quando você atualizar o código pelo GitHub (`git pull`).
+  - Se o arquivo `data/history.json` ainda não existir na primeira vez que o servidor iniciar, o `server.ts` o criará automaticamente sem tocar nos itens que você já baixou.
 
 ---
 
-### 3. Key Product Decisions & Trade-Offs
-
-- **Decisão 1: Usar `-S` (Format Sorting) em vez de Filtros Estritos `[height<=...]`**
-  - *Abordagem Escolhida*: `-f "bv*+ba/b" -S "res:${quality},ext:mp4:m4a,vcodec:h264,acodec:aac" --merge-output-format mp4`.
-  - *Por quê*: Garante 100% de compatibilidade com vídeos horizontais, verticais (Shorts) e vídeos antigos que não possuam streams separados, entregando sempre um arquivo `.mp4` válido.
-- **Decisão 2: Fallback Automático de Cookies no YouTube**
-  - *Abordagem Escolhida*: Para YouTube, executar a tentativa primária sem cookies (aproveitando os clientes móveis nativos do `yt-dlp`) e, se retornar erro de autenticação/idade, executar imediatamente a segunda tentativa com `--cookies /app/data/cookies.txt`. Para Instagram, manter o uso imediato dos cookies.
-  - *Por quê*: Evita que o YouTube bloqueie os formatos em vídeos públicos por causa de restrições do cliente `web` autenticado, ao mesmo tempo em que garante o download de vídeos +18 usando a sua conta.
-
----
-
-### 4. Technical Architecture & Data Strategy *(Technical Reference)*
-
-```text
-┌──────────────────────────────────────────────────────────────────────────┐
-│                     Rota GET /api/download (Backend)                     │
-└────────────────────────────────────┬─────────────────────────────────────┘
-                                     │
-         ┌───────────────────────────┴───────────────────────────┐
-         ▼ (Instagram)                                           ▼ (YouTube)
-┌─────────────────────────────────┐             ┌─────────────────────────────────┐
-│ • Executa yt-dlp COM cookies    │             │ 1ª Tentativa (Rápida / Pública) │
-│ • -f "bv*+ba/b"                 │             │ • Clientes nativos (sem bloqueio│
-│ • -S "ext:mp4:m4a,vcodec:h264"  │             │   de formato do cliente web)    │
-│ • --merge-output-format mp4     │             │ • -f "bv*+ba/b" -S "res:1080,   │
-└────────────────┬────────────────┘             │   ext:mp4:m4a,vcodec:h264"      │
-                 │                              └────────────────┬────────────────┘
-                 │                                               │ Se exigir login/+18
-                 │                                               ▼
-                 │                              ┌─────────────────────────────────┐
-                 │                              │ 2ª Tentativa Automática         │
-                 │                              │ • Reexecuta COM cookies.txt     │
-                 │                              │ • Clientes web/tv_embedded      │
-                 └───────────────────┬──────────┴────────────────┬────────────────┘
-                                     ▼                           ▼
-                        ┌──────────────────────────────────────────────┐
-                        │  Arquivo .MP4 / .MP3 transmitido ao Browser  │
-                        └──────────────────────────────────────────────┘
-```
+## Arquivos que Serão Atualizados
+1. `docker-compose.yml` e `.env.example`: Adição do container `cloudflared` conectado à rede interna do `uv-downloader` usando o token da sua conta Cloudflare.
+2. `server.ts` e `src/types.ts`: Persistência garantida de `/app/data/history.json` e `/app/data/settings.json` (para lembrar o domínio personalizado do seu Homelab) e exposição do status no `/api/server-info`.
+3. `src/components/HomelabModal.tsx`: Nova aba/seção para o seu **Domínio Cloudflare Zero Trust** com guia passo a passo de vinculação a `http://uv-downloader:3000`, link clicável e QR Code para o celular.
+4. `.gitignore`: Proteção de `data/history.json` e `data/settings.json` para que atualizações do Git nunca apaguem seu histórico salvo.

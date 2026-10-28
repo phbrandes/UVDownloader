@@ -142,3 +142,45 @@ export async function saveCookiesContent(content: string): Promise<import('../ty
 export async function deleteCookiesFile(): Promise<void> {
   await fetch('/api/cookies', { method: 'DELETE' });
 }
+
+export async function fetchTunnelInfo(): Promise<import('../types').TunnelInfo> {
+  try {
+    const res = await fetch('/api/tunnel');
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (e) {
+    // offline
+  }
+  return {
+    mode: 'off',
+    status: 'disconnected',
+    publicDomain: '',
+    hasToken: false,
+  };
+}
+
+export async function saveTunnelConfig(payload: {
+  mode: 'custom' | 'quick' | 'off';
+  publicDomain?: string;
+  tunnelToken?: string;
+}): Promise<import('../types').TunnelInfo> {
+  const res = await fetch('/api/tunnel', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || 'Falha ao salvar configuração do túnel Cloudflare');
+  }
+  return await res.json();
+}
+
+export async function stopCloudflareTunnel(): Promise<import('../types').TunnelInfo> {
+  const res = await fetch('/api/tunnel', { method: 'DELETE' });
+  if (!res.ok) {
+    throw new Error('Falha ao desligar túnel Cloudflare');
+  }
+  return await res.json();
+}

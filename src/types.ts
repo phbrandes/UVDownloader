@@ -56,6 +56,16 @@ export interface HistoryRecord {
   timestamp: number;
 }
 
+export interface TunnelInfo {
+  mode: 'custom' | 'quick' | 'off';
+  status: 'connected' | 'starting' | 'disconnected' | 'error';
+  publicDomain: string;
+  quickTunnelUrl?: string;
+  activeUrl?: string;
+  hasToken: boolean;
+  lastError?: string;
+}
+
 export interface ServerInfo {
   status: string;
   uptime: number;
@@ -68,6 +78,7 @@ export interface ServerInfo {
   nodeVersion: string;
   historyCount: number;
   environment: string;
+  tunnel?: TunnelInfo;
 }
 
 export interface CookiesInfo {

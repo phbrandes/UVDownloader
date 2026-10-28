@@ -1,6 +1,6 @@
 {
-  "summary":  "Plano de implementacao para corrigir o erro 'Requested format is not available' no YouTube, usando ordenacao flexivel de formatos (-S res,ext:mp4:m4a), runtime JS Node.js e fallback inteligente de cookies.",
-  "updatedAt":  "2026-10-28T17:45:14.269551881Z",
+  "summary":  "Plano atualizado para configurar um domínio fixo personalizado com a conta Cloudflare do usuário (Cloudflare Zero Trust Tunnel no Docker Compose) e garantir a persistência permanente do histórico de downloads em disco sem conflitos com o Git.",
+  "updatedAt":  "2026-10-28T18:53:14.777324501Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

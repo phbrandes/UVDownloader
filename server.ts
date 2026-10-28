@@ -15,10 +15,17 @@ const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
 
-// Persistent storage path for homelab downloads history
+// Persistent storage path for homelab downloads history, cookies, and tunnel settings
 const DATA_DIR = path.resolve(__dirname, 'data');
 const HISTORY_FILE = path.resolve(DATA_DIR, 'history.json');
 const COOKIES_FILE = path.resolve(DATA_DIR, 'cookies.txt');
+const SETTINGS_FILE = path.resolve(DATA_DIR, 'settings.json');
+
+interface HomelabSettings {
+  tunnelMode: 'custom' | 'quick' | 'off';
+  publicDomain: string;
+  tunnelToken: string;
+}
 
 function getCookiesInfo() {
   if (!fs.existsSync(COOKIES_FILE)) {
@@ -62,6 +69,42 @@ function ensureDataStorage() {
   if (!fs.existsSync(HISTORY_FILE)) {
     fs.writeFileSync(HISTORY_FILE, JSON.stringify([], null, 2), 'utf-8');
   }
+  if (!fs.existsSync(SETTINGS_FILE)) {
+    const initialSettings: HomelabSettings = {
+      tunnelMode: process.env.CLOUDFLARE_TUNNEL_TOKEN ? 'custom' : 'off',
+      publicDomain: process.env.PUBLIC_DOMAIN || '',
+      tunnelToken: process.env.CLOUDFLARE_TUNNEL_TOKEN || '',
+    };
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(initialSettings, null, 2), 'utf-8');
+  }
+}
+
+function readSettings(): HomelabSettings {
+  try {
+    ensureDataStorage();
+    const raw = fs.readFileSync(SETTINGS_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    return {
+      tunnelMode: parsed.tunnelMode || (process.env.CLOUDFLARE_TUNNEL_TOKEN ? 'custom' : 'off'),
+      publicDomain: parsed.publicDomain || process.env.PUBLIC_DOMAIN || '',
+      tunnelToken: parsed.tunnelToken || process.env.CLOUDFLARE_TUNNEL_TOKEN || '',
+    };
+  } catch {
+    return {
+      tunnelMode: process.env.CLOUDFLARE_TUNNEL_TOKEN ? 'custom' : 'off',
+      publicDomain: process.env.PUBLIC_DOMAIN || '',
+      tunnelToken: process.env.CLOUDFLARE_TUNNEL_TOKEN || '',
+    };
+  }
+}
+
+function writeSettings(settings: HomelabSettings): void {
+  try {
+    ensureDataStorage();
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Error writing settings file:', err);
+  }
 }
 
 function readHistory(): any[] {
@@ -86,6 +129,174 @@ function writeHistory(items: any[]): void {
 
 // Ensure storage initialized on boot
 ensureDataStorage();
+
+// ================= CLOUDFLARE TUNNEL MANAGER ================= //
+let tunnelProc: ReturnType<typeof spawn> | null = null;
+let tunnelStatus: 'connected' | 'starting' | 'disconnected' | 'error' = 'disconnected';
+let quickTunnelUrl = '';
+let lastTunnelError = '';
+
+function cleanTokenInput(rawInput: string): string {
+  const trimmed = rawInput.trim();
+  if (!trimmed) return '';
+  // If user pasted the full command from Cloudflare Zero Trust dashboard (e.g. "docker run ... --token eyJ..." or "cloudflared service install eyJ...")
+  const jwtMatch = trimmed.match(/eyJ[A-Za-z0-9_\-=]+/);
+  if (jwtMatch && jwtMatch[0]) {
+    return jwtMatch[0];
+  }
+  return trimmed;
+}
+
+function normalizeDomainInput(rawDomain: string): string {
+  const trimmed = rawDomain.trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    return trimmed.replace(/\/+$/, '');
+  }
+  return `https://${trimmed.replace(/\/+$/, '')}`;
+}
+
+async function resolveCloudflaredBin(): Promise<string> {
+  if (fs.existsSync('/usr/local/bin/cloudflared')) {
+    return '/usr/local/bin/cloudflared';
+  }
+  const tmpBin = '/tmp/cloudflared';
+  if (fs.existsSync(tmpBin)) {
+    return tmpBin;
+  }
+  // Auto-download official cloudflared binary to /tmp/cloudflared if not installed in system PATH
+  try {
+    const res = await fetch(
+      'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64',
+      { redirect: 'follow' }
+    );
+    if (res.ok && res.body) {
+      const arrayBuffer = await res.arrayBuffer();
+      fs.writeFileSync(tmpBin, Buffer.from(arrayBuffer));
+      fs.chmodSync(tmpBin, 0o755);
+      return tmpBin;
+    }
+  } catch (err) {
+    console.warn('Could not auto-download cloudflared binary:', err);
+  }
+  return 'cloudflared';
+}
+
+function stopTunnelProcess() {
+  if (tunnelProc) {
+    try {
+      tunnelProc.kill('SIGTERM');
+    } catch {}
+    tunnelProc = null;
+  }
+  tunnelStatus = 'disconnected';
+  quickTunnelUrl = '';
+}
+
+async function startOrRestartTunnel() {
+  stopTunnelProcess();
+  lastTunnelError = '';
+
+  const settings = readSettings();
+  if (settings.tunnelMode === 'off') {
+    return;
+  }
+
+  if (settings.tunnelMode === 'custom' && !settings.tunnelToken) {
+    tunnelStatus = 'error';
+    lastTunnelError = 'Token do Cloudflare Zero Trust não informado.';
+    return;
+  }
+
+  tunnelStatus = 'starting';
+  const bin = await resolveCloudflaredBinarySafe();
+
+  const args =
+    settings.tunnelMode === 'custom'
+      ? ['tunnel', '--no-autoupdate', 'run', '--token', settings.tunnelToken]
+      : ['tunnel', '--no-autoupdate', '--url', `http://127.0.0.1:${PORT}`];
+
+  try {
+    const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    tunnelProc = proc;
+
+    const handleLog = (chunk: Buffer) => {
+      const text = chunk.toString();
+      // Detect Quick Tunnel trycloudflare.com URL
+      const tryMatch = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
+      if (tryMatch && tryMatch[0]) {
+        quickTunnelUrl = tryMatch[0];
+        tunnelStatus = 'connected';
+      }
+      // Detect Named Tunnel registration
+      if (
+        text.includes('Registered tunnel connection') ||
+        text.includes('Connection') && text.includes('registered')
+      ) {
+        tunnelStatus = 'connected';
+        lastTunnelError = '';
+      }
+      if (text.includes('Provided Tunnel token is not valid')) {
+        tunnelStatus = 'error';
+        lastTunnelError = 'O Token Cloudflare informado é inválido. Copie novamente do painel Zero Trust.';
+      }
+    };
+
+    proc.stdout.on('data', handleLog);
+    proc.stderr.on('data', handleLog);
+
+    proc.on('error', (err) => {
+      if (tunnelProc === proc) {
+        tunnelStatus = 'error';
+        lastTunnelError = `Falha ao iniciar cloudflared: ${err.message}`;
+      }
+    });
+
+    proc.on('close', (code) => {
+      if (tunnelProc === proc) {
+        tunnelProc = null;
+        if (tunnelStatus !== 'error') {
+          tunnelStatus = 'disconnected';
+        }
+        if (code && code !== 0 && !lastTunnelError) {
+          tunnelStatus = 'error';
+          lastTunnelError = `Túnel encerrado (código ${code}). Verifique o token na sua conta Cloudflare.`;
+        }
+      }
+    });
+  } catch (err: any) {
+    tunnelStatus = 'error';
+    lastTunnelError = err?.message || 'Erro ao iniciar processo cloudflared.';
+  }
+}
+
+async function resolveCloudflaredBinarySafe(): Promise<string> {
+  try {
+    return await resolveCloudflaredBin();
+  } catch {
+    return 'cloudflared';
+  }
+}
+
+function getTunnelInfo() {
+  const settings = readSettings();
+  const activeUrl =
+    settings.tunnelMode === 'custom'
+      ? settings.publicDomain
+      : settings.tunnelMode === 'quick'
+      ? quickTunnelUrl
+      : '';
+
+  return {
+    mode: settings.tunnelMode,
+    status: tunnelStatus,
+    publicDomain: settings.publicDomain,
+    quickTunnelUrl,
+    activeUrl,
+    hasToken: Boolean(settings.tunnelToken),
+    lastError: lastTunnelError || undefined,
+  };
+}
 
 interface QualityOptionItem {
   id: string;
@@ -1104,6 +1315,7 @@ app.get('/api/server-info', (req: Request, res: Response) => {
     historyCount: history.length,
     environment: process.env.NODE_ENV || 'development',
     cookies: getCookiesInfo(),
+    tunnel: getTunnelInfo(),
   });
 });
 
@@ -1139,6 +1351,68 @@ app.delete('/api/cookies', (req: Request, res: Response) => {
   }
 });
 
+// 11. GET /api/tunnel (Check Cloudflare Tunnel & custom domain status)
+app.get('/api/tunnel', (req: Request, res: Response) => {
+  return res.json(getTunnelInfo());
+});
+
+// 12. POST /api/tunnel (Save custom domain / Cloudflare token and start tunnel)
+app.post('/api/tunnel', async (req: Request, res: Response) => {
+  try {
+    const { mode, publicDomain, tunnelToken } = req.body as {
+      mode?: 'custom' | 'quick' | 'off';
+      publicDomain?: string;
+      tunnelToken?: string;
+    };
+
+    const current = readSettings();
+    const updatedMode = mode || 'custom';
+    const updatedDomain =
+      typeof publicDomain === 'string' ? normalizeDomainInput(publicDomain) : current.publicDomain;
+    const cleanedToken =
+      typeof tunnelToken === 'string' && tunnelToken.trim()
+        ? cleanTokenInput(tunnelToken)
+        : current.tunnelToken;
+
+    if (updatedMode === 'custom' && !cleanedToken) {
+      return res.status(400).json({
+        error: 'Cole o Token do seu túnel Cloudflare Zero Trust (ou o comando completo exibido no painel da Cloudflare).',
+      });
+    }
+
+    const updatedSettings: HomelabSettings = {
+      tunnelMode: updatedMode,
+      publicDomain: updatedDomain,
+      tunnelToken: cleanedToken,
+    };
+
+    writeSettings(updatedSettings);
+    await startOrRestartTunnel();
+
+    // Wait briefly so quick tunnel or named tunnel can report initial status
+    await new Promise((r) => setTimeout(r, 1500));
+
+    return res.json(getTunnelInfo());
+  } catch (error: any) {
+    return res.status(500).json({ error: 'Erro ao configurar túnel Cloudflare: ' + error.message });
+  }
+});
+
+// 13. DELETE /api/tunnel (Stop Cloudflare tunnel)
+app.delete('/api/tunnel', (req: Request, res: Response) => {
+  try {
+    const current = readSettings();
+    writeSettings({
+      ...current,
+      tunnelMode: 'off',
+    });
+    stopTunnelProcess();
+    return res.json(getTunnelInfo());
+  } catch (error: any) {
+    return res.status(500).json({ error: 'Erro ao desligar túnel Cloudflare' });
+  }
+});
+
 // Serve frontend with Vite middlewares in development or static dist in production
 async function startServer() {
   if (process.env.NODE_ENV === 'production' && fs.existsSync(path.resolve(__dirname, 'dist'))) {
@@ -1156,6 +1430,11 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[UV Downloader] Servidor Homelab ativo em http://0.0.0.0:${PORT}`);
+    // Automatically start Cloudflare Tunnel if previously enabled in ./data/settings.json or .env
+    const initialSettings = readSettings();
+    if (initialSettings.tunnelMode !== 'off') {
+      startOrRestartTunnel().catch((err) => console.warn('Tunnel auto-start error:', err));
+    }
   });
 }
 
