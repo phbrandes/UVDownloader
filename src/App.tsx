@@ -12,7 +12,7 @@ import {
   clearAllHistory,
   fetchServerInfo,
 } from './services/api';
-import { MediaResult, HistoryRecord, ServerInfo, Platform } from './types';
+import { MediaResult, HistoryRecord, ServerInfo } from './types';
 import { AlertCircle, CheckCircle2, X } from 'lucide-react';
 
 export default function App() {
@@ -24,18 +24,12 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  // Load initial history and server diagnostics
+  // Load initial history and server diagnostics in parallel
   useEffect(() => {
-    async function loadInitialData() {
-      const hist = await fetchHistory();
+    Promise.all([fetchHistory(), fetchServerInfo()]).then(([hist, info]) => {
       setHistory(hist);
-
-      const info = await fetchServerInfo();
-      if (info) {
-        setServerInfo(info);
-      }
-    }
-    loadInitialData();
+      if (info) setServerInfo(info);
+    });
   }, []);
 
   const showToast = (msg: string) => {
@@ -52,7 +46,6 @@ export default function App() {
       setCurrentMedia(media);
       showToast('Mídia analisada com sucesso! Escolha o formato desejado.');
     } catch (err: any) {
-      console.error('Falha na extração:', err);
       setErrorMessage(
         err.message ||
           'Não foi possível extrair este link. Certifique-se de que a publicação seja pública e a URL esteja correta.'
@@ -65,7 +58,6 @@ export default function App() {
   const handleDownloadCompleted = (item: HistoryRecord) => {
     setHistory((prev) => [item, ...prev.filter((h) => h.id !== item.id)]);
     showToast(`Download de "${item.title.slice(0, 30)}..." iniciado!`);
-    // Refresh server info count
     fetchServerInfo().then((info) => {
       if (info) setServerInfo(info);
     });
@@ -90,10 +82,7 @@ export default function App() {
   };
 
   const scrollToHistory = () => {
-    const el = document.getElementById('history-section');
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth' });
-    }
+    document.getElementById('history-section')?.scrollIntoView({ behavior: 'smooth' });
   };
 
   const scrollToTop = () => {
@@ -102,7 +91,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-sky-500 selection:text-white">
-      {/* Toast Notification */}
       {toastMessage && (
         <div className="fixed bottom-5 right-5 z-50 flex items-center gap-2 px-4 py-2.5 bg-slate-900 border border-sky-500/50 text-slate-100 text-xs font-medium rounded-xl shadow-2xl animate-in fade-in slide-in-from-bottom-2 duration-200">
           <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
@@ -110,7 +98,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Header */}
       <Header
         serverInfo={serverInfo}
         onOpenHomelabModal={() => setIsHomelabModalOpen(true)}
@@ -118,16 +105,9 @@ export default function App() {
         onScrollToTop={scrollToTop}
       />
 
-      {/* Main Content */}
       <main className="flex-1">
-        {/* Hero & Capture Section */}
-        <HeroCapture
-          onExtract={handleExtract}
-          isLoading={isLoading}
-          activePlatform={currentMedia ? currentMedia.platform : null}
-        />
+        <HeroCapture onExtract={handleExtract} isLoading={isLoading} />
 
-        {/* Error notification banner */}
         {errorMessage && (
           <div className="max-w-3xl mx-auto px-4 mb-8">
             <div className="p-4 bg-rose-950/40 border border-rose-800/60 rounded-xl flex items-start gap-3 text-rose-200 text-xs sm:text-sm">
@@ -146,7 +126,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Media Preview & Formats Card */}
         {currentMedia && (
           <MediaResultCard
             media={currentMedia}
@@ -155,7 +134,6 @@ export default function App() {
           />
         )}
 
-        {/* History Dashboard */}
         <HistoryDashboard
           history={history}
           onRemoveItem={handleRemoveHistoryItem}
@@ -163,18 +141,15 @@ export default function App() {
           onReloadHistory={handleReloadHistory}
         />
 
-        {/* Platform & How it Works Section */}
         <FeaturesSection />
       </main>
 
-      {/* Homelab Modal */}
       <HomelabModal
         isOpen={isHomelabModalOpen}
         onClose={() => setIsHomelabModalOpen(false)}
         serverInfo={serverInfo}
       />
 
-      {/* Footer */}
       <footer className="w-full bg-slate-950 border-t border-slate-900 py-8 px-4 text-center text-xs text-slate-500">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2">

@@ -1,6 +1,43 @@
-import { HistoryRecord, MediaResult, ServerInfo } from '../types';
+import { CookiesInfo, HistoryRecord, MediaResult, ServerInfo, TunnelInfo } from '../types';
 
 const LOCAL_STORAGE_HISTORY_KEY = 'uv_downloader_history_backup';
+
+/**
+ * Dispara o download do arquivo usando o gerenciador nativo do navegador no Homelab/Cloudflare
+ * (sem acumular o vídeo na memória RAM), ou via Blob dentro do iframe de preview.
+ */
+export async function triggerBrowserDownload(url: string, rawFilename: string): Promise<void> {
+  const filename = rawFilename.replace(/[\\/:*?"<>|]/g, '_');
+  const isAiStudioPreview = window.location.hostname.endsWith('.run.app');
+
+  if (!isAiStudioPreview) {
+    const link = document.createElement('a');
+    link.style.display = 'none';
+    link.href = url;
+    link.setAttribute('download', filename);
+    document.body.appendChild(link);
+    link.click();
+    setTimeout(() => document.body.removeChild(link), 5000);
+    return;
+  }
+
+  const response = await fetch(url, { credentials: 'include' });
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '');
+    throw new Error(errorText || `Erro no servidor (${response.status}).`);
+  }
+  const blobUrl = window.URL.createObjectURL(await response.blob());
+  const link = document.createElement('a');
+  link.style.display = 'none';
+  link.href = blobUrl;
+  link.setAttribute('download', filename);
+  document.body.appendChild(link);
+  link.click();
+  setTimeout(() => {
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(blobUrl);
+  }, 10000);
+}
 
 export async function extractMedia(url: string): Promise<MediaResult> {
   const res = await fetch('/api/extract', {
@@ -24,61 +61,46 @@ export async function fetchHistory(): Promise<HistoryRecord[]> {
     if (res.ok) {
       const json = await res.json();
       const serverHistory = json.data || [];
-      // Sync to localStorage
       try {
         localStorage.setItem(LOCAL_STORAGE_HISTORY_KEY, JSON.stringify(serverHistory));
-      } catch (e) {
-        // ignore quota errors
-      }
+      } catch {}
       return serverHistory;
     }
-  } catch (err) {
-    console.warn('Servidor inacessível, recuperando histórico do cache local:', err);
-  }
+  } catch {}
 
-  // Fallback to local storage
   try {
     const local = localStorage.getItem(LOCAL_STORAGE_HISTORY_KEY);
     return local ? JSON.parse(local) : [];
-  } catch (e) {
+  } catch {
     return [];
   }
 }
 
 export async function saveHistoryItem(item: HistoryRecord): Promise<void> {
-  // Save to local storage first
   try {
     const local = localStorage.getItem(LOCAL_STORAGE_HISTORY_KEY);
     const existing: HistoryRecord[] = local ? JSON.parse(local) : [];
     const updated = [item, ...existing.filter((h) => h.id !== item.id)].slice(0, 200);
     localStorage.setItem(LOCAL_STORAGE_HISTORY_KEY, JSON.stringify(updated));
-  } catch (e) {
-    // ignore
-  }
+  } catch {}
 
-  // Push to server
   try {
     await fetch('/api/history', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(item),
     });
-  } catch (err) {
-    console.warn('Falha ao salvar no servidor homelab:', err);
-  }
+  } catch {}
 }
 
 export async function removeHistoryItem(id: string): Promise<HistoryRecord[]> {
-  // Update local storage
   let updated: HistoryRecord[] = [];
   try {
     const local = localStorage.getItem(LOCAL_STORAGE_HISTORY_KEY);
     const existing: HistoryRecord[] = local ? JSON.parse(local) : [];
     updated = existing.filter((item) => item.id !== id);
     localStorage.setItem(LOCAL_STORAGE_HISTORY_KEY, JSON.stringify(updated));
-  } catch (e) {
-    // ignore
-  }
+  } catch {}
 
   try {
     const res = await fetch(`/api/history/${id}`, { method: 'DELETE' });
@@ -86,9 +108,7 @@ export async function removeHistoryItem(id: string): Promise<HistoryRecord[]> {
       const json = await res.json();
       return json.data;
     }
-  } catch (err) {
-    console.warn('Erro ao deletar no servidor:', err);
-  }
+  } catch {}
 
   return updated;
 }
@@ -97,36 +117,26 @@ export async function clearAllHistory(): Promise<void> {
   try {
     localStorage.removeItem(LOCAL_STORAGE_HISTORY_KEY);
     await fetch('/api/history', { method: 'DELETE' });
-  } catch (err) {
-    console.warn('Erro ao limpar histórico no servidor:', err);
-  }
+  } catch {}
 }
 
 export async function fetchServerInfo(): Promise<ServerInfo | null> {
   try {
     const res = await fetch('/api/server-info');
-    if (res.ok) {
-      return await res.json();
-    }
-  } catch (e) {
-    // homelab offline or booting
-  }
+    if (res.ok) return await res.json();
+  } catch {}
   return null;
 }
 
-export async function fetchCookiesInfo(): Promise<import('../types').CookiesInfo> {
+export async function fetchCookiesInfo(): Promise<CookiesInfo> {
   try {
     const res = await fetch('/api/cookies');
-    if (res.ok) {
-      return await res.json();
-    }
-  } catch (e) {
-    // homelab offline
-  }
+    if (res.ok) return await res.json();
+  } catch {}
   return { exists: false, domains: [] };
 }
 
-export async function saveCookiesContent(content: string): Promise<import('../types').CookiesInfo> {
+export async function saveCookiesContent(content: string): Promise<CookiesInfo> {
   const res = await fetch('/api/cookies', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -143,15 +153,11 @@ export async function deleteCookiesFile(): Promise<void> {
   await fetch('/api/cookies', { method: 'DELETE' });
 }
 
-export async function fetchTunnelInfo(): Promise<import('../types').TunnelInfo> {
+export async function fetchTunnelInfo(): Promise<TunnelInfo> {
   try {
     const res = await fetch('/api/tunnel');
-    if (res.ok) {
-      return await res.json();
-    }
-  } catch (e) {
-    // offline
-  }
+    if (res.ok) return await res.json();
+  } catch {}
   return {
     mode: 'off',
     status: 'disconnected',
@@ -164,7 +170,7 @@ export async function saveTunnelConfig(payload: {
   mode: 'custom' | 'quick' | 'off';
   publicDomain?: string;
   tunnelToken?: string;
-}): Promise<import('../types').TunnelInfo> {
+}): Promise<TunnelInfo> {
   const res = await fetch('/api/tunnel', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -177,7 +183,7 @@ export async function saveTunnelConfig(payload: {
   return await res.json();
 }
 
-export async function stopCloudflareTunnel(): Promise<import('../types').TunnelInfo> {
+export async function stopCloudflareTunnel(): Promise<TunnelInfo> {
   const res = await fetch('/api/tunnel', { method: 'DELETE' });
   if (!res.ok) {
     throw new Error('Falha ao desligar túnel Cloudflare');

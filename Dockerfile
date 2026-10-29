@@ -8,26 +8,16 @@ RUN apk add --no-cache ffmpeg python3 py3-pip curl libc6-compat && \
 
 WORKDIR /app
 
-# Copiar arquivos de dependências
 COPY package*.json ./
-
-# Instalar dependências
 RUN npm install --legacy-peer-deps
 
-# Copiar código-fonte do projeto
 COPY . .
+RUN npm run build && mkdir -p /app/data
 
-# Compilar o frontend React/Vite para produção (pasta dist/)
-RUN npm run build
-
-# Criar pasta persistente para o histórico
-RUN mkdir -p /app/data
-
-# Definir variáveis de ambiente padrão
 ENV NODE_ENV=production
 ENV PORT=3000
 
 EXPOSE 3000
 
-# Iniciar o servidor Express servindo o frontend compilado e as rotas da API
-CMD ["npx", "tsx", "server.ts"]
+# Inicializar diretamente via binário local tsx sem overhead de npx
+CMD ["./node_modules/.bin/tsx", "server.ts"]

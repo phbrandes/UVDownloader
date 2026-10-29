@@ -55,6 +55,7 @@ export const HomelabModal: React.FC<HomelabModalProps> = ({
 
   // Cloudflare Tunnel state
   const [tunnelInfo, setTunnelInfo] = useState<TunnelInfo | null>(null);
+  const [tunnelSubTab, setTunnelSubTab] = useState<'quick' | 'custom'>('quick');
   const [domainInput, setDomainInput] = useState('');
   const [tokenInput, setTokenInput] = useState('');
   const [isSavingTunnel, setIsSavingTunnel] = useState(false);
@@ -65,6 +66,11 @@ export const HomelabModal: React.FC<HomelabModalProps> = ({
       fetchCookiesInfo().then((info) => setCookiesInfo(info));
       fetchTunnelInfo().then((info) => {
         setTunnelInfo(info);
+        if (info.mode === 'custom') {
+          setTunnelSubTab('custom');
+        } else {
+          setTunnelSubTab('quick');
+        }
         if (info.publicDomain) {
           setDomainInput(info.publicDomain);
         }
@@ -392,119 +398,214 @@ export const HomelabModal: React.FC<HomelabModalProps> = ({
                 </div>
               )}
 
-              {/* Option 1: Custom Domain via Cloudflare Zero Trust Account */}
-              <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h4 className="text-xs font-bold text-white uppercase tracking-wider">
-                      1. Configurar Domínio Fixo na sua Conta Cloudflare (Zero Trust)
-                    </h4>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      Use um domínio da sua conta Cloudflare (ex.: <code className="text-sky-300">uvdownloader.com</code>) para entrar sem digitar IP.
-                    </p>
-                  </div>
-                  {tunnelInfo?.hasToken && (
-                    <span className="text-[11px] font-medium text-emerald-400 bg-emerald-950/50 border border-emerald-800/50 px-2 py-0.5 rounded">
-                      Token Salvo
-                    </span>
-                  )}
-                </div>
-
-                <div className="space-y-3">
-                  <div>
-                    <label className="block text-xs font-medium text-slate-300 mb-1">
-                      Seu Domínio Personalizado (ex.: https://uvdownloader.com)
-                    </label>
-                    <input
-                      type="text"
-                      value={domainInput}
-                      onChange={(e) => setDomainInput(e.target.value)}
-                      placeholder="https://uvdownloader.com"
-                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-white placeholder-slate-600 focus:outline-none focus:border-sky-500 font-mono"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-medium text-slate-300 mb-1">
-                      Token do Túnel Cloudflare (ou cole o comando completo da Cloudflare)
-                    </label>
-                    <input
-                      type="password"
-                      value={tokenInput}
-                      onChange={(e) => setTokenInput(e.target.value)}
-                      placeholder={
-                        tunnelInfo?.hasToken
-                          ? '•••••••••••••••••••••••• (Token já salvo — cole outro apenas se quiser trocar)'
-                          : 'Cole aqui: eyJhIjoi... ou docker run cloudflare/cloudflared ... --token eyJ...'
-                      }
-                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-white placeholder-slate-600 focus:outline-none focus:border-sky-500 font-mono"
-                    />
-                    <p className="text-[11px] text-slate-500 mt-1">
-                      Você pode colar o comando inteiro que aparece na Cloudflare — o sistema extrai o código <code className="text-slate-400">eyJ...</code> automaticamente.
-                    </p>
-                  </div>
-
-                  <div className="flex justify-end">
-                    <button
-                      type="button"
-                      onClick={handleSaveCustomTunnel}
-                      disabled={isSavingTunnel || (!tokenInput.trim() && !tunnelInfo?.hasToken)}
-                      className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-sky-600 hover:bg-sky-500 disabled:opacity-50 rounded-lg transition-colors"
-                    >
-                      <Check className="w-3.5 h-3.5" />
-                      <span>Salvar e Ativar Meu Domínio</span>
-                    </button>
-                  </div>
-                </div>
-
-                {/* Step-by-step instructions for Cloudflare Zero Trust Dashboard */}
-                <div className="p-3.5 bg-slate-900/70 border border-slate-800/80 rounded-xl space-y-2 text-xs text-slate-400">
-                  <div className="font-semibold text-slate-200 flex items-center gap-1.5">
-                    <HelpCircle className="w-3.5 h-3.5 text-sky-400" />
-                    <span>Quais botões apertar no painel da sua conta Cloudflare:</span>
-                  </div>
-                  <ol className="list-decimal pl-4 space-y-1.5 leading-relaxed">
-                    <li>
-                      Entre na sua conta em <strong className="text-slate-200">one.dash.cloudflare.com</strong> (Cloudflare Zero Trust) e no menu lateral clique em <strong className="text-slate-200">Networks</strong> &rarr; <strong className="text-slate-200">Tunnels</strong>.
-                    </li>
-                    <li>
-                      Clique no botão azul <strong className="text-slate-200">Create a tunnel</strong>, selecione a opção <strong className="text-slate-200">Cloudflared</strong>, digite o nome <code className="text-sky-300">uv-downloader</code> e clique em <strong className="text-slate-200">Save tunnel</strong>.
-                    </li>
-                    <li>
-                      Na tela <strong className="text-slate-200">Install and run a connector</strong>, clique no botão de copiar o comando (que termina com um código longo começando com <code className="text-sky-300">eyJ...</code>) e cole no campo de Token acima.
-                    </li>
-                    <li>
-                      Lá na Cloudflare, clique em <strong className="text-slate-200">Next</strong> (aba <strong className="text-slate-200">Public Hostname</strong>):
-                      <ul className="list-disc pl-4 mt-1 space-y-0.5 text-slate-300">
-                        <li>Em <strong>Domain</strong>: escolha o seu domínio cadastrado na Cloudflare (ex.: <code>uvdownloader.com</code>).</li>
-                        <li>Em <strong>Service Type</strong>: escolha <code>HTTP</code>.</li>
-                        <li>Em <strong>URL</strong>: digite <code>localhost:3000</code> e clique em <strong>Save tunnel</strong>.</li>
-                      </ul>
-                    </li>
-                  </ol>
-                </div>
-              </div>
-
-              {/* Option 2: Instant Free HTTPS Link without owning a paid domain */}
-              <div className="p-4 bg-slate-950/40 border border-slate-800/70 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-                <div className="space-y-1">
-                  <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-200">
-                    <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                    <span>Ainda não comprou um domínio .com na Cloudflare?</span>
-                  </div>
-                  <p className="text-xs text-slate-400">
-                    Gere um endereço HTTPS gratuito instantâneo da Cloudflare (<code className="text-slate-300">https://...trycloudflare.com</code>) com 1 clique para usar no celular agora mesmo.
-                  </p>
-                </div>
+              {/* Subtab Switcher: Free Quick Tunnel vs Custom Domain */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 bg-slate-950/70 p-1.5 rounded-xl border border-slate-800">
                 <button
                   type="button"
-                  onClick={handleStartQuickTunnel}
-                  disabled={isSavingTunnel}
-                  className="px-3.5 py-2 text-xs font-semibold text-slate-200 hover:text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors shrink-0"
+                  onClick={() => setTunnelSubTab('quick')}
+                  className={`flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-xs font-semibold transition-all ${
+                    tunnelSubTab === 'quick'
+                      ? 'bg-sky-600 text-white shadow-md'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/60'
+                  }`}
                 >
-                  Gerar Link Gratuito
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>⚡ Túnel Gratuito (TryCloudflare)</span>
+                  {tunnelInfo?.mode === 'quick' && tunnelInfo.status === 'connected' && (
+                    <span className="w-2 h-2 rounded-full bg-emerald-300 animate-pulse" />
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setTunnelSubTab('custom')}
+                  className={`flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-xs font-semibold transition-all ${
+                    tunnelSubTab === 'custom'
+                      ? 'bg-sky-600 text-white shadow-md'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/60'
+                  }`}
+                >
+                  <Globe className="w-3.5 h-3.5" />
+                  <span>🌐 Domínio Personalizado (Opcional)</span>
+                  {tunnelInfo?.mode === 'custom' && tunnelInfo.status === 'connected' && (
+                    <span className="w-2 h-2 rounded-full bg-emerald-300 animate-pulse" />
+                  )}
                 </button>
               </div>
+
+              {/* Subtab 1: Free Quick Tunnel (TryCloudflare) */}
+              {tunnelSubTab === 'quick' && (
+                <div className="p-5 bg-slate-950/70 border border-slate-800/90 rounded-xl space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-bold text-white uppercase tracking-wider">
+                          Acesso Remoto Gratuito sem Domínio
+                        </span>
+                        <span className="text-[10px] font-semibold text-emerald-400 bg-emerald-950/70 border border-emerald-800/60 px-2 py-0.5 rounded">
+                          Instantâneo
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                        Cria um link HTTPS seguro temporário (<code className="text-sky-300 font-mono">https://*.trycloudflare.com</code>) diretamente pelos servidores da Cloudflare. Não precisa de cadastro, cartão ou domínio próprio.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-slate-300">
+                    <div className="p-2.5 bg-slate-900/80 border border-slate-800/70 rounded-lg flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span>Zero configuração de roteador (dispensa abrir portas)</span>
+                    </div>
+                    <div className="p-2.5 bg-slate-900/80 border border-slate-800/70 rounded-lg flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span>Acesse do celular fora de casa no 4G/5G</span>
+                    </div>
+                    <div className="p-2.5 bg-slate-900/80 border border-slate-800/70 rounded-lg flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span>QR Code instantâneo para escanear com a câmera</span>
+                    </div>
+                    <div className="p-2.5 bg-slate-900/80 border border-slate-800/70 rounded-lg flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span>Preserva seu histórico persistente e cookies</span>
+                    </div>
+                  </div>
+
+                  <div className="pt-2 flex flex-wrap items-center justify-between gap-3 border-t border-slate-800/70">
+                    <div className="text-xs text-slate-400">
+                      {tunnelInfo?.mode === 'quick' && tunnelInfo.status === 'connected' ? (
+                        <span className="text-emerald-400 font-medium flex items-center gap-1.5">
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          Túnel gratuito conectado e pronto para uso!
+                        </span>
+                      ) : (
+                        <span>Pronto para conectar com apenas 1 clique.</span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      {tunnelInfo?.mode === 'quick' && tunnelInfo.status === 'connected' ? (
+                        <button
+                          type="button"
+                          onClick={handleStartQuickTunnel}
+                          disabled={isSavingTunnel}
+                          className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors"
+                        >
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          <span>Gerar Novo Link Gratuito</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={handleStartQuickTunnel}
+                          disabled={isSavingTunnel}
+                          className="flex items-center gap-2 px-5 py-2.5 text-xs font-bold text-white bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 rounded-lg shadow-lg shadow-sky-600/25 transition-all transform hover:scale-[1.01]"
+                        >
+                          <Sparkles className="w-4 h-4 text-amber-300" />
+                          <span>{isSavingTunnel ? 'Conectando à Cloudflare...' : 'Ativar Túnel Gratuito Agora'}</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Subtab 2: Custom Domain via Cloudflare Zero Trust */}
+              {tunnelSubTab === 'custom' && (
+                <div className="p-5 bg-slate-950/70 border border-slate-800/90 rounded-xl space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-bold text-white uppercase tracking-wider">
+                          Domínio Fixo na sua Conta Cloudflare (Zero Trust)
+                        </span>
+                        {tunnelInfo?.hasToken && (
+                          <span className="text-[10px] font-semibold text-emerald-400 bg-emerald-950/70 border border-emerald-800/60 px-2 py-0.5 rounded">
+                            Token Cadastrado
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                        Quando você quiser usar um domínio permanente que comprou ou cadastrou na Cloudflare (ex.: <code className="text-sky-300 font-mono">https://uvdownloader.com</code>), configure aqui com o token da sua conta.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-3">
+                    <div>
+                      <label className="block text-xs font-medium text-slate-300 mb-1">
+                        Seu Domínio Personalizado (ex.: https://uvdownloader.com)
+                      </label>
+                      <input
+                        type="text"
+                        value={domainInput}
+                        onChange={(e) => setDomainInput(e.target.value)}
+                        placeholder="https://uvdownloader.com"
+                        className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-xs text-white placeholder-slate-600 focus:outline-none focus:border-sky-500 font-mono"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-300 mb-1">
+                        Token do Túnel Cloudflare (ou comando copiado do painel)
+                      </label>
+                      <input
+                        type="password"
+                        value={tokenInput}
+                        onChange={(e) => setTokenInput(e.target.value)}
+                        placeholder={
+                          tunnelInfo?.hasToken
+                            ? '•••••••••••••••••••••••• (Token já salvo — cole outro se quiser trocar)'
+                            : 'Cole aqui: eyJhIjoi... ou docker run cloudflare/cloudflared ... --token eyJ...'
+                        }
+                        className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-xs text-white placeholder-slate-600 focus:outline-none focus:border-sky-500 font-mono"
+                      />
+                      <p className="text-[11px] text-slate-500 mt-1">
+                        Pode colar o comando inteiro que aparece na tela da Cloudflare — o sistema extrai o código <code className="text-slate-400">eyJ...</code> automaticamente.
+                      </p>
+                    </div>
+
+                    <div className="flex justify-end pt-1">
+                      <button
+                        type="button"
+                        onClick={handleSaveCustomTunnel}
+                        disabled={isSavingTunnel || (!tokenInput.trim() && !tunnelInfo?.hasToken)}
+                        className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-sky-600 hover:bg-sky-500 disabled:opacity-50 rounded-lg transition-colors"
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                        <span>Salvar e Ativar Meu Domínio</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Step-by-step instructions for Cloudflare Zero Trust Dashboard */}
+                  <div className="p-3.5 bg-slate-900/70 border border-slate-800/80 rounded-xl space-y-2 text-xs text-slate-400">
+                    <div className="font-semibold text-slate-200 flex items-center gap-1.5">
+                      <HelpCircle className="w-3.5 h-3.5 text-sky-400" />
+                      <span>Passo a passo no painel Cloudflare Zero Trust:</span>
+                    </div>
+                    <ol className="list-decimal pl-4 space-y-1.5 leading-relaxed">
+                      <li>
+                        Entre em <strong className="text-slate-200">one.dash.cloudflare.com</strong> &rarr; menu lateral <strong className="text-slate-200">Networks</strong> &rarr; <strong className="text-slate-200">Tunnels</strong>.
+                      </li>
+                      <li>
+                        Clique em <strong className="text-slate-200">Create a tunnel</strong> &rarr; escolha <strong className="text-slate-200">Cloudflared</strong> &rarr; nomeie como <code className="text-sky-300">uv-downloader</code> &rarr; clique em <strong className="text-slate-200">Save tunnel</strong>.
+                      </li>
+                      <li>
+                        Na tela <strong className="text-slate-200">Install and run a connector</strong>, copie o comando (que termina com o código <code className="text-sky-300">eyJ...</code>) e cole no campo acima.
+                      </li>
+                      <li>
+                        Na aba <strong className="text-slate-200">Public Hostname</strong> da Cloudflare:
+                        <ul className="list-disc pl-4 mt-1 space-y-0.5 text-slate-300">
+                          <li><strong>Domain</strong>: selecione seu domínio (ex.: <code>uvdownloader.com</code>).</li>
+                          <li><strong>Service Type</strong>: escolha <code>HTTP</code>.</li>
+                          <li><strong>URL</strong>: digite <code>localhost:3000</code> e salve.</li>
+                        </ul>
+                      </li>
+                    </ol>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 

@@ -1,5 +1,5 @@
 import React from 'react';
-import { Youtube, Instagram, Shield, Zap, Sparkles, DownloadCloud, CheckCircle2 } from 'lucide-react';
+import { Youtube, Instagram, Zap, DownloadCloud } from 'lucide-react';
 
 export const FeaturesSection: React.FC = () => {
   return (
@@ -14,7 +14,6 @@ export const FeaturesSection: React.FC = () => {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-        {/* Feature 1: TikTok */}
         <div className="p-6 bg-slate-900/60 border border-slate-800 rounded-2xl hover:border-slate-700 transition-all">
           <div className="w-10 h-10 rounded-xl bg-cyan-950/60 text-cyan-400 border border-cyan-800/40 flex items-center justify-center mb-4">
             <Zap className="w-5 h-5" />
@@ -25,7 +24,6 @@ export const FeaturesSection: React.FC = () => {
           </p>
         </div>
 
-        {/* Feature 2: Instagram */}
         <div className="p-6 bg-slate-900/60 border border-slate-800 rounded-2xl hover:border-slate-700 transition-all">
           <div className="w-10 h-10 rounded-xl bg-pink-950/60 text-pink-400 border border-pink-800/40 flex items-center justify-center mb-4">
             <Instagram className="w-5 h-5" />
@@ -36,7 +34,6 @@ export const FeaturesSection: React.FC = () => {
           </p>
         </div>
 
-        {/* Feature 3: YouTube */}
         <div className="p-6 bg-slate-900/60 border border-slate-800 rounded-2xl hover:border-slate-700 transition-all">
           <div className="w-10 h-10 rounded-xl bg-red-950/60 text-red-400 border border-red-800/40 flex items-center justify-center mb-4">
             <Youtube className="w-5 h-5" />
@@ -47,7 +44,6 @@ export const FeaturesSection: React.FC = () => {
           </p>
         </div>
 
-        {/* Feature 4: Pinterest */}
         <div className="p-6 bg-slate-900/60 border border-slate-800 rounded-2xl hover:border-slate-700 transition-all">
           <div className="w-10 h-10 rounded-xl bg-rose-950/60 text-rose-400 border border-rose-800/40 flex items-center justify-center mb-4">
             <DownloadCloud className="w-5 h-5" />

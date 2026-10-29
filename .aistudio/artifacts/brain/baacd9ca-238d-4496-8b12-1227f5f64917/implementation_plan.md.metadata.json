@@ -1,6 +1,6 @@
 {
-  "summary":  "Plano atualizado para configurar um domínio fixo personalizado com a conta Cloudflare do usuário (Cloudflare Zero Trust Tunnel no Docker Compose) e garantir a persistência permanente do histórico de downloads em disco sem conflitos com o Git.",
-  "updatedAt":  "2026-10-28T18:53:14.777324501Z",
+  "summary":  "Plano de otimização global da base de código do UVDownloader: cache temporário inteligente de 10 minutos para metadados e arquivos MP4/MP3 em /tmp com limpeza automática, unificação da lógica de download nativo no frontend, carregamento inicial paralelo (Promise.all), remoção de código morto/imports não utilizados e inicialização direta no Dockerfile sem sobrecarga de npx.",
+  "updatedAt":  "2026-10-28T22:01:04.876824392Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

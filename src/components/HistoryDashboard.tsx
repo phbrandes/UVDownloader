@@ -4,16 +4,13 @@ import {
   Download,
   Trash2,
   Search,
-  Filter,
-  Check,
   Video,
   Music,
-  Image as ImageIcon,
-  ExternalLink,
   RefreshCw,
   FolderDown,
 } from 'lucide-react';
-import { HistoryRecord, Platform } from '../types';
+import { HistoryRecord } from '../types';
+import { triggerBrowserDownload } from '../services/api';
 
 interface HistoryDashboardProps {
   history: HistoryRecord[];
@@ -21,6 +18,14 @@ interface HistoryDashboardProps {
   onClearHistory: () => void;
   onReloadHistory: () => void;
 }
+
+const PLATFORM_BADGE_STYLES: Record<string, string> = {
+  youtube: 'bg-red-950/60 border-red-800/50 text-red-400',
+  instagram: 'bg-pink-950/60 border-pink-800/50 text-pink-400',
+  tiktok: 'bg-cyan-950/60 border-cyan-800/50 text-cyan-400',
+  pinterest: 'bg-rose-950/60 border-rose-800/50 text-rose-400',
+  generic: 'bg-slate-800 text-slate-400 border-slate-700',
+};
 
 export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({
   history,
@@ -32,23 +37,22 @@ export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
 
-  // Platform count stats
-  const stats = useMemo(() => {
-    return {
+  const stats = useMemo(
+    () => ({
       all: history.length,
       youtube: history.filter((h) => h.platform === 'youtube').length,
       instagram: history.filter((h) => h.platform === 'instagram').length,
       tiktok: history.filter((h) => h.platform === 'tiktok').length,
       pinterest: history.filter((h) => h.platform === 'pinterest').length,
-    };
-  }, [history]);
+    }),
+    [history]
+  );
 
-  // Filtered items
   const filteredHistory = useMemo(() => {
+    const query = searchQuery.toLowerCase().trim();
     return history.filter((item) => {
       const matchesPlatform =
         selectedPlatform === 'all' || item.platform === selectedPlatform;
-      const query = searchQuery.toLowerCase().trim();
       const matchesQuery =
         !query ||
         item.title.toLowerCase().includes(query) ||
@@ -61,24 +65,7 @@ export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({
   const handleRedownload = async (item: HistoryRecord) => {
     setDownloadingId(item.id);
     try {
-      const response = await fetch(item.downloadUrl, {
-        credentials: 'include',
-      });
-      if (!response.ok) {
-        throw new Error(`Erro ao baixar arquivo (${response.status})`);
-      }
-      const blob = await response.blob();
-      const blobUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.style.display = 'none';
-      link.href = blobUrl;
-      link.setAttribute('download', `${item.title || 'media'}.${item.format}`);
-      document.body.appendChild(link);
-      link.click();
-      setTimeout(() => {
-        document.body.removeChild(link);
-        window.URL.revokeObjectURL(blobUrl);
-      }, 10000);
+      await triggerBrowserDownload(item.downloadUrl, `${item.title || 'media'}.${item.format}`);
     } catch (e) {
       console.error('Erro ao rebaixar arquivo:', e);
     } finally {
@@ -94,23 +81,14 @@ export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({
         hour: '2-digit',
         minute: '2-digit',
       }).format(new Date(timestamp));
-    } catch (e) {
+    } catch {
       return 'Recentemente';
     }
-  };
-
-  const platformBadgeStyles: Record<string, string> = {
-    youtube: 'bg-red-950/60 border-red-800/50 text-red-400',
-    instagram: 'bg-pink-950/60 border-pink-800/50 text-pink-400',
-    tiktok: 'bg-cyan-950/60 border-cyan-800/50 text-cyan-400',
-    pinterest: 'bg-rose-950/60 border-rose-800/50 text-rose-400',
-    generic: 'bg-slate-800 text-slate-400 border-slate-700',
   };
 
   return (
     <section id="history-section" className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
       <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-6 sm:p-8 shadow-xl">
-        {/* Header row */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-6 border-b border-slate-800">
           <div>
             <div className="flex items-center gap-2 mb-1">
@@ -135,11 +113,7 @@ export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({
 
             {history.length > 0 && (
               <button
-                onClick={() => {
-                  if (confirm('Deseja realmente limpar todo o histórico de downloads?')) {
-                    onClearHistory();
-                  }
-                }}
+                onClick={onClearHistory}
                 className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-rose-400 hover:text-rose-300 hover:bg-rose-950/50 border border-rose-900/50 rounded-lg transition-all"
               >
                 <Trash2 className="w-3.5 h-3.5" />
@@ -149,9 +123,7 @@ export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({
           </div>
         </div>
 
-        {/* Filter Bar & Search */}
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-4 my-6">
-          {/* Platform Segmented Tabs */}
           <div className="flex items-center overflow-x-auto p-1 bg-slate-950 rounded-xl border border-slate-800 shrink-0">
             {[
               { id: 'all', label: 'Todos', count: stats.all },
@@ -180,7 +152,6 @@ export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({
             })}
           </div>
 
-          {/* Search Input */}
           <div className="relative min-w-[240px]">
             <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
             <input
@@ -193,7 +164,6 @@ export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({
           </div>
         </div>
 
-        {/* History Grid */}
         {filteredHistory.length === 0 ? (
           <div className="py-16 text-center border border-dashed border-slate-800/80 rounded-2xl">
             <History className="w-12 h-12 text-slate-600 mx-auto mb-3" />
@@ -214,7 +184,6 @@ export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({
                   className="bg-slate-950/70 border border-slate-800/80 rounded-xl p-4 flex flex-col justify-between hover:border-slate-700 transition-all group"
                 >
                   <div className="flex gap-3 mb-3">
-                    {/* Thumbnail */}
                     <div className="w-16 h-16 rounded-lg bg-slate-900 overflow-hidden shrink-0 relative border border-slate-800">
                       {item.thumbnail ? (
                         <img
@@ -235,7 +204,7 @@ export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({
                       <div className="absolute top-1 left-1">
                         <span
                           className={`text-[9px] font-bold px-1 py-0.5 rounded uppercase ${
-                            platformBadgeStyles[item.platform] || platformBadgeStyles.generic
+                            PLATFORM_BADGE_STYLES[item.platform] || PLATFORM_BADGE_STYLES.generic
                           }`}
                         >
                           {item.platform.slice(0, 2)}
@@ -243,7 +212,6 @@ export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({
                       </div>
                     </div>
 
-                    {/* Metadata */}
                     <div className="min-w-0 flex-1">
                       <h4 className="text-xs font-semibold text-white truncate mb-1">
                         {item.title}
@@ -261,7 +229,6 @@ export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({
                     </div>
                   </div>
 
-                  {/* Footer actions */}
                   <div className="pt-3 border-t border-slate-800/80 flex items-center justify-between text-[11px]">
                     <span className="text-slate-400 font-mono tabular-nums">
                       {formatDate(item.timestamp)}

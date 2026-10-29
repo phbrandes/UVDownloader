@@ -1,32 +1,84 @@
-# Plano Atualizado: Domínio Próprio com Conta Cloudflare + Persistência Permanente do Histórico
+# UVDownloader — Otimização Global de Código, Cache Inteligente e Inicialização
 
-## 1. Domínio Fixo Personalizado via Conta Cloudflare (Cloudflare Zero Trust Tunnel)
-Como você já possui uma conta na Cloudflare e deseja acessar por um endereço fixo (como `uvdownloader.com` ou `uv.seudominio.com`) sem nunca digitar IP e sem o link mudar ao reiniciar:
+Revisão e enxugamento completo da base de código do **UVDownloader** para reduzir ainda mais o tamanho do projeto, eliminar código duplicado no frontend, acelerar o boot no Docker e entregar downloads repetidos ou compartilhados em **0,01 segundo** por meio de cache temporário com limpeza automática.
 
-- **Integração no `docker-compose.yml` com `TUNNEL_TOKEN`:**
-  - Configuraremos o serviço oficial `cloudflared` no `docker-compose.yml` no modo **Zero Trust Named Tunnel** (`tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}`).
-  - Criaremos o suporte ao arquivo `.env` (e `.env.example`) onde você cola o `CLOUDFLARE_TUNNEL_TOKEN` da sua conta Cloudflare e o seu `PUBLIC_DOMAIN` (ex.: `https://uvdownloader.com`).
-- **Aba "Domínio & Cloudflare" no Modal Configurar Homelab (`HomelabModal.tsx`):**
-  - Exibirá o seu endereço fixo configurado (com **QR Code** para escanear com o celular e botão de copiar).
-  - Incluirá o passo a passo direto de **3 passos no painel Cloudflare Zero Trust** (`Networks -> Tunnels`) apontando o seu domínio para `http://uv-downloader:3000` (nome do container na rede interna do Docker).
-  - Permitirá salvar/atualizar o endereço do seu domínio personalizado diretamente pela interface para ficar salvo no seu painel.
+## Revisão e Decisões Confirmadas
+
+> [!IMPORTANT]
+> **Todas as decisões foram confirmadas para máxima performance e código enxuto:**
+> - **Cache Temporário de Mídia e Metadados (10 min)**: Quando você ou um familiar colar um link já analisado ou clicar para baixar novamente um vídeo (ou re-baixar pelo Histórico), o servidor entregará o arquivo já processado instantaneamente a partir do `/tmp`, limpando automaticamente os arquivos após 10 minutos para não ocupar disco.
+> - **Unificação e Limpeza do Frontend + Docker**: A função de disparo de download nativo (que estava duplicada entre o card de resultado e o painel de histórico) será centralizada, as chamadas iniciais de inicialização serão paralelizadas com `Promise.all`, importações e estados mortos serão removidos, e o container Docker iniciará diretamente o binário local sem a sobrecarga do `npx`.
 
 ---
 
-## 2. Persistência Permanente do Histórico de Downloads (`./data/history.json`)
-Você tem toda razão: o histórico **deve persistir para sempre** entre sessões, reinicializações do PC e atualizações do container.
+## 1. Visão Geral & Conceito Central
 
-- **Por que houve conflito antes:**
-  - O arquivo `data/history.json` estava sendo rastreado pelo Git como se fosse um arquivo de código. Por isso, quando você baixava vídeos no seu PC (alterando o seu `data/history.json` local) e tentava dar `git pull`, o Git dava erro de conflito ou sobrescrevia o seu histórico com o arquivo do GitHub.
-- **Como vamos resolver definitivamente:**
-  - **Persistência no Volume Docker (`./data:/app/data`):** O `server.ts` continuará salvando todos os vídeos baixados em `./data/history.json` no disco do seu CachyOS, mantendo seu histórico intacto mesmo se você fechar o navegador, reiniciar o container ou desligar o PC.
-  - **Proteção no `.gitignore`:** Colocaremos `data/history.json` e `data/settings.json` no `.gitignore` (assim como já fizemos com `data/cookies.txt`). Dessa forma, o seu histórico local **nunca será apagado ou sobrescrito** quando você atualizar o código pelo GitHub (`git pull`).
-  - Se o arquivo `data/history.json` ainda não existir na primeira vez que o servidor iniciar, o `server.ts` o criará automaticamente sem tocar nos itens que você já baixou.
+- **O Que Faz**: Refina toda a arquitetura do UVDownloader para que tanto a análise de links quanto o download de vídeos e áudios operem na velocidade máxima da rede, com menor consumo de CPU/RAM e uma base de código mais limpa e fácil de manter.
+- **Público / Uso**: Uso pessoal e compartilhado com familiares/amigos via túnel Cloudflare no seu servidor Homelab CachyOS.
+- **Valor Principal**: Zero retrabalho do `yt-dlp`/`ffmpeg` em links repetidos nos últimos 10 minutos, carregamento inicial mais rápido da interface e redução de linhas desnecessárias em todo o projeto.
 
 ---
 
-## Arquivos que Serão Atualizados
-1. `docker-compose.yml` e `.env.example`: Adição do container `cloudflared` conectado à rede interna do `uv-downloader` usando o token da sua conta Cloudflare.
-2. `server.ts` e `src/types.ts`: Persistência garantida de `/app/data/history.json` e `/app/data/settings.json` (para lembrar o domínio personalizado do seu Homelab) e exposição do status no `/api/server-info`.
-3. `src/components/HomelabModal.tsx`: Nova aba/seção para o seu **Domínio Cloudflare Zero Trust** com guia passo a passo de vinculação a `http://uv-downloader:3000`, link clicável e QR Code para o celular.
-4. `.gitignore`: Proteção de `data/history.json` e `data/settings.json` para que atualizações do Git nunca apaguem seu histórico salvo.
+## 2. Experiência do Usuário & Design Visual
+
+- **Fluxo de Uso Otimizado**:
+  1. **Abertura Instantânea**: Ao abrir o painel, o histórico persistente e o status do túnel Cloudflare são carregados simultaneamente em paralelo (`Promise.all`).
+  2. **Extração com Cache em Memória**: Se o mesmo link for consultado novamente dentro de 10 minutos (por exemplo, ao testar diferentes formatos ou compartilhar o link com outra pessoa), os metadados aparecem instantaneamente sem nova requisição externa.
+  3. **Download com Cache de Arquivo (`/tmp`)**: O primeiro download usa 8 conexões paralelas (`-N 8`) e mesclagem única; se o mesmo vídeo e resolução forem solicitados novamente em até 10 minutos (ou baixados de novo pela aba Histórico), a transferência começa imediatamente na velocidade máxima do túnel.
+- **Identidade Visual & Tema**:
+  - *Direção Estética*: Utilitário Dark Homelab (`#07090E` background, `#0D111A` cards, `#10B981` emerald e `#0EA5E9` sky accents), mantendo 100% da interface limpa e responsiva.
+  - *Tipografia & Hierarquia*: `Space Grotesk` para títulos, `Plus Jakarta Sans` para leitura fluida e `JetBrains Mono` para indicadores técnicos e links do túnel.
+
+---
+
+## 3. Decisões Técnicas & Trade-Offs
+
+- **Decisão 1: Cache Temporário de 10 Minutos com Auto-Expiração (TTL)**
+  - *Abordagem Escolhida*: Mapear chaves normalizadas `(url + qualidade)` para arquivos temporários em `/tmp` e metadados em memória, com um coletor periódico (`setInterval`) que remove arquivos expirados após 10 minutos.
+  - *Por quê*: Evita que o `yt-dlp` e o `ffmpeg` tenham que baixar e unir novamente o mesmo vídeo quando o usuário clica duas vezes, compartilha com alguém ou usa o botão de re-download no Histórico, sem acumular lixo no SSD do Homelab.
+- **Decisão 2: Centralização do Utilitário de Download e Limpeza de Código Morto**
+  - *Abordagem Escolhida*: Mover a lógica de detecção de ambiente (iframe vs. Homelab/Cloudflare) e disparo de download para uma única função compartilhada na camada de serviço da API, removendo estados obsoletos de progresso simulado e ícones não utilizados nos componentes React.
+  - *Por quê*: Elimina dezenas de linhas repetidas no frontend e reduz o bundle final compilado pelo Vite.
+- **Decisão 3: Execução Direta no Container Docker**
+  - *Abordagem Escolhida*: Substituir `npx tsx server.ts` pela execução direta do binário instalado em `node_modules/.bin/tsx` e construir o frontend em etapa enxuta.
+  - *Por quê*: Corta o tempo de resolução de pacotes do `npx` toda vez que o container reinicia no CachyOS.
+
+---
+
+## 4. Arquitetura Técnica & Estratégia de Dados
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                     FRONTEND REACT (Inicialização Paralela)              │
+│                                                                          │
+│  ┌────────────────────┐   ┌────────────────────┐   ┌──────────────────┐  │
+│  │    HeroCapture     │   │  MediaResultCard   │   │ HistoryDashboard │  │
+│  └─────────┬──────────┘   └─────────┬──────────┘   └────────┬─────────┘  │
+│            │                        └───────────┬───────────┘            │
+│            ▼                                    ▼                        │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │         Camada Unificada de API + triggerBrowserDownload()         │  │
+│  └─────────┬────────────────────────────────────┬─────────────────────┘  │
+└────────────┼────────────────────────────────────┼────────────────────────┘
+             │ POST /api/extract                  │ GET /api/proxy-download
+             ▼                                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                     SERVIDOR EXPRESS (Homelab / Docker)                  │
+│                                                                          │
+│  ┌──────────────────────────────────┐  ┌──────────────────────────────┐  │
+│  │ Cache de Metadados (RAM, 10 min) │  │ Cache de Mídia (/tmp, 10 min)│  │
+│  │  • Hit: Retorno em < 1ms         │  │  • Hit: Stream imediato      │  │
+│  │  • Miss: Extrator + Salva Cache  │  │  • Miss: yt-dlp -N 8 -> /tmp │  │
+│  └──────────────────────────────────┘  └──────────────┬───────────────┘  │
+│                                                       │                  │
+│                                                       ▼                  │
+│                                        ┌──────────────────────────────┐  │
+│                                        │ Limpeza Automática (GC 60s)  │  │
+│                                        │ Remove arquivos > 10 min     │  │
+│                                        └──────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### Mapeamento de Estado e Ciclo de Vida
+- **Normalização de Chave de Cache**: Links do YouTube (`youtu.be/ID?is=...` e `youtube.com/watch?v=ID`) geram a mesma chave canônica, garantindo que mesmo links com parâmetros de compartilhamento diferentes aproveitem o cache de metadados e de vídeo.
+- **Deduplicação de Downloads Simultâneos**: Se dois dispositivos clicarem para baixar o mesmo vídeo ao mesmo tempo, ou se o arquivo já estiver no cache de 10 minutos em `/tmp`, o servidor envia o arquivo pronto via stream HTTP com suporte a `Content-Length` sem apagar o arquivo até que o TTL de 10 minutos expire.

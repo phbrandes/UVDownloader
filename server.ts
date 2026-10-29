@@ -6,20 +6,25 @@ import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
 import { spawn } from 'child_process';
 import os from 'os';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
 app.use(express.json());
 
-// Persistent storage path for homelab downloads history, cookies, and tunnel settings
+// ================= PERSISTENT STORAGE (./data) ================= //
 const DATA_DIR = path.resolve(__dirname, 'data');
 const HISTORY_FILE = path.resolve(DATA_DIR, 'history.json');
 const COOKIES_FILE = path.resolve(DATA_DIR, 'cookies.txt');
 const SETTINGS_FILE = path.resolve(DATA_DIR, 'settings.json');
+const TEMP_DIR = fs.existsSync('/tmp') ? '/tmp' : os.tmpdir();
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes TTL for metadata & temp MP4/MP3 cache
 
 interface HomelabSettings {
   tunnelMode: 'custom' | 'quick' | 'off';
@@ -27,107 +32,118 @@ interface HomelabSettings {
   tunnelToken: string;
 }
 
-function getCookiesInfo() {
-  if (!fs.existsSync(COOKIES_FILE)) {
-    return { exists: false, domains: [] };
-  }
-  try {
-    const stats = fs.statSync(COOKIES_FILE);
-    const content = fs.readFileSync(COOKIES_FILE, 'utf-8');
-    const domainsSet = new Set<string>();
-    const lines = content.split('\n');
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) {
-        if (trimmed.startsWith('#HttpOnly_')) {
-          const parts = trimmed.split('\t');
-          if (parts[0]) domainsSet.add(parts[0].replace('#HttpOnly_', '').replace(/^\./, ''));
-        }
-        continue;
-      }
-      const parts = trimmed.split('\t');
-      if (parts[0]) {
-        domainsSet.add(parts[0].replace(/^\./, ''));
-      }
-    }
-    const formatKB = (bytes: number) => `${(bytes / 1024).toFixed(1)} KB`;
-    return {
-      exists: true,
-      size: formatKB(stats.size),
-      domains: Array.from(domainsSet).slice(0, 8),
-      lastModified: stats.mtime.toLocaleDateString('pt-BR'),
-    };
-  } catch (e) {
-    return { exists: false, domains: [] };
-  }
+interface QualityOptionItem {
+  id: string;
+  label: string;
+  resolution?: string;
+  format: 'mp4' | 'mp3' | 'jpg' | 'jpeg' | 'png' | 'webp';
+  type: 'video' | 'audio' | 'image';
+  size?: string;
+  url: string;
+  hasWatermark: boolean;
 }
+
+// ================= 10-MINUTE SMART CACHE (/tmp + RAM) ================= //
+const extractCache = new Map<string, { platform: string; data: any; expiresAt: number }>();
+const mediaFileCache = new Map<string, { file: string; expiresAt: number }>();
+const inFlightDownloads = new Map<string, Promise<{ ok: boolean; file: string; err: string }>>();
+
+function normalizeCacheUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  const ytMatch = trimmed.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  if (ytMatch?.[1]) {
+    return trimmed.includes('/shorts/')
+      ? `https://www.youtube.com/shorts/${ytMatch[1]}`
+      : `https://www.youtube.com/watch?v=${ytMatch[1]}`;
+  }
+  if (/instagram\.com|instagr\.am/i.test(trimmed)) {
+    return trimmed.split('?')[0].replace(/\/+$/, '');
+  }
+  return trimmed;
+}
+
+// Periodic Garbage Collector (every 60s) for expired metadata & /tmp media files
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of extractCache.entries()) {
+    if (now > entry.expiresAt) extractCache.delete(key);
+  }
+  for (const [key, entry] of mediaFileCache.entries()) {
+    if (now > entry.expiresAt) {
+      mediaFileCache.delete(key);
+      try {
+        if (fs.existsSync(entry.file)) fs.unlinkSync(entry.file);
+      } catch {}
+    }
+  }
+}, 60_000).unref();
 
 function ensureDataStorage() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (!fs.existsSync(HISTORY_FILE)) {
-    fs.writeFileSync(HISTORY_FILE, JSON.stringify([], null, 2), 'utf-8');
-  }
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, '[]', 'utf-8');
   if (!fs.existsSync(SETTINGS_FILE)) {
-    const initialSettings: HomelabSettings = {
+    const defaults: HomelabSettings = {
       tunnelMode: process.env.CLOUDFLARE_TUNNEL_TOKEN ? 'custom' : 'off',
       publicDomain: process.env.PUBLIC_DOMAIN || '',
       tunnelToken: process.env.CLOUDFLARE_TUNNEL_TOKEN || '',
     };
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(initialSettings, null, 2), 'utf-8');
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(defaults, null, 2), 'utf-8');
   }
 }
+
+function readJson<T>(filePath: string, fallback: T): T {
+  try {
+    ensureDataStorage();
+    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(filePath: string, data: unknown): void {
+  try {
+    ensureDataStorage();
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+  } catch (err) {
+    console.error(`Error writing ${filePath}:`, err);
+  }
+}
+
+const readHistory = () => readJson<any[]>(HISTORY_FILE, []);
+const writeHistory = (items: any[]) => writeJson(HISTORY_FILE, items);
 
 function readSettings(): HomelabSettings {
+  const parsed = readJson<Partial<HomelabSettings>>(SETTINGS_FILE, {});
+  return {
+    tunnelMode: parsed.tunnelMode || (process.env.CLOUDFLARE_TUNNEL_TOKEN ? 'custom' : 'off'),
+    publicDomain: parsed.publicDomain || process.env.PUBLIC_DOMAIN || '',
+    tunnelToken: parsed.tunnelToken || process.env.CLOUDFLARE_TUNNEL_TOKEN || '',
+  };
+}
+
+function getCookiesInfo() {
+  if (!fs.existsSync(COOKIES_FILE)) return { exists: false, domains: [] };
   try {
-    ensureDataStorage();
-    const raw = fs.readFileSync(SETTINGS_FILE, 'utf-8');
-    const parsed = JSON.parse(raw);
+    const stats = fs.statSync(COOKIES_FILE);
+    const lines = fs.readFileSync(COOKIES_FILE, 'utf-8').split('\n');
+    const domains = new Set<string>();
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t || (t.startsWith('#') && !t.startsWith('#HttpOnly_'))) continue;
+      const host = t.replace('#HttpOnly_', '').split('\t')[0]?.replace(/^\./, '');
+      if (host) domains.add(host);
+    }
     return {
-      tunnelMode: parsed.tunnelMode || (process.env.CLOUDFLARE_TUNNEL_TOKEN ? 'custom' : 'off'),
-      publicDomain: parsed.publicDomain || process.env.PUBLIC_DOMAIN || '',
-      tunnelToken: parsed.tunnelToken || process.env.CLOUDFLARE_TUNNEL_TOKEN || '',
+      exists: true,
+      size: `${(stats.size / 1024).toFixed(1)} KB`,
+      domains: Array.from(domains).slice(0, 8),
+      lastModified: stats.mtime.toLocaleDateString('pt-BR'),
     };
   } catch {
-    return {
-      tunnelMode: process.env.CLOUDFLARE_TUNNEL_TOKEN ? 'custom' : 'off',
-      publicDomain: process.env.PUBLIC_DOMAIN || '',
-      tunnelToken: process.env.CLOUDFLARE_TUNNEL_TOKEN || '',
-    };
+    return { exists: false, domains: [] };
   }
 }
 
-function writeSettings(settings: HomelabSettings): void {
-  try {
-    ensureDataStorage();
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('Error writing settings file:', err);
-  }
-}
-
-function readHistory(): any[] {
-  try {
-    ensureDataStorage();
-    const data = fs.readFileSync(HISTORY_FILE, 'utf-8');
-    return JSON.parse(data);
-  } catch (err) {
-    console.error('Error reading history file:', err);
-    return [];
-  }
-}
-
-function writeHistory(items: any[]): void {
-  try {
-    ensureDataStorage();
-    fs.writeFileSync(HISTORY_FILE, JSON.stringify(items, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('Error writing history file:', err);
-  }
-}
-
-// Ensure storage initialized on boot
 ensureDataStorage();
 
 // ================= CLOUDFLARE TUNNEL MANAGER ================= //
@@ -136,49 +152,32 @@ let tunnelStatus: 'connected' | 'starting' | 'disconnected' | 'error' = 'disconn
 let quickTunnelUrl = '';
 let lastTunnelError = '';
 
-function cleanTokenInput(rawInput: string): string {
-  const trimmed = rawInput.trim();
-  if (!trimmed) return '';
-  // If user pasted the full command from Cloudflare Zero Trust dashboard (e.g. "docker run ... --token eyJ..." or "cloudflared service install eyJ...")
-  const jwtMatch = trimmed.match(/eyJ[A-Za-z0-9_\-=]+/);
-  if (jwtMatch && jwtMatch[0]) {
-    return jwtMatch[0];
-  }
-  return trimmed;
+function cleanTokenInput(raw: string): string {
+  const match = raw.trim().match(/eyJ[A-Za-z0-9_\-=]+/);
+  return match ? match[0] : raw.trim();
 }
 
-function normalizeDomainInput(rawDomain: string): string {
-  const trimmed = rawDomain.trim();
-  if (!trimmed) return '';
-  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-    return trimmed.replace(/\/+$/, '');
-  }
-  return `https://${trimmed.replace(/\/+$/, '')}`;
+function normalizeDomainInput(raw: string): string {
+  const t = raw.trim().replace(/\/+$/, '');
+  if (!t) return '';
+  return /^https?:\/\//i.test(t) ? t : `https://${t}`;
 }
 
 async function resolveCloudflaredBin(): Promise<string> {
-  if (fs.existsSync('/usr/local/bin/cloudflared')) {
-    return '/usr/local/bin/cloudflared';
-  }
+  if (fs.existsSync('/usr/local/bin/cloudflared')) return '/usr/local/bin/cloudflared';
   const tmpBin = '/tmp/cloudflared';
-  if (fs.existsSync(tmpBin)) {
-    return tmpBin;
-  }
-  // Auto-download official cloudflared binary to /tmp/cloudflared if not installed in system PATH
+  if (fs.existsSync(tmpBin)) return tmpBin;
   try {
     const res = await fetch(
       'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64',
       { redirect: 'follow' }
     );
-    if (res.ok && res.body) {
-      const arrayBuffer = await res.arrayBuffer();
-      fs.writeFileSync(tmpBin, Buffer.from(arrayBuffer));
+    if (res.ok) {
+      fs.writeFileSync(tmpBin, Buffer.from(await res.arrayBuffer()));
       fs.chmodSync(tmpBin, 0o755);
       return tmpBin;
     }
-  } catch (err) {
-    console.warn('Could not auto-download cloudflared binary:', err);
-  }
+  } catch {}
   return 'cloudflared';
 }
 
@@ -196,12 +195,8 @@ function stopTunnelProcess() {
 async function startOrRestartTunnel() {
   stopTunnelProcess();
   lastTunnelError = '';
-
   const settings = readSettings();
-  if (settings.tunnelMode === 'off') {
-    return;
-  }
-
+  if (settings.tunnelMode === 'off') return;
   if (settings.tunnelMode === 'custom' && !settings.tunnelToken) {
     tunnelStatus = 'error';
     lastTunnelError = 'Token do Cloudflare Zero Trust não informado.';
@@ -209,8 +204,7 @@ async function startOrRestartTunnel() {
   }
 
   tunnelStatus = 'starting';
-  const bin = await resolveCloudflaredBinarySafe();
-
+  const bin = await resolveCloudflaredBin();
   const args =
     settings.tunnelMode === 'custom'
       ? ['tunnel', '--no-autoupdate', 'run', '--token', settings.tunnelToken]
@@ -220,131 +214,99 @@ async function startOrRestartTunnel() {
     const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     tunnelProc = proc;
 
-    const handleLog = (chunk: Buffer) => {
+    const onLog = (chunk: Buffer) => {
       const text = chunk.toString();
-      // Detect Quick Tunnel trycloudflare.com URL
       const tryMatch = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
-      if (tryMatch && tryMatch[0]) {
+      if (tryMatch) {
         quickTunnelUrl = tryMatch[0];
         tunnelStatus = 'connected';
       }
-      // Detect Named Tunnel registration
-      if (
-        text.includes('Registered tunnel connection') ||
-        text.includes('Connection') && text.includes('registered')
-      ) {
+      if (text.includes('Registered tunnel connection') || (text.includes('Connection') && text.includes('registered'))) {
         tunnelStatus = 'connected';
         lastTunnelError = '';
       }
       if (text.includes('Provided Tunnel token is not valid')) {
         tunnelStatus = 'error';
-        lastTunnelError = 'O Token Cloudflare informado é inválido. Copie novamente do painel Zero Trust.';
+        lastTunnelError = 'O Token Cloudflare informado é inválido.';
       }
     };
 
-    proc.stdout.on('data', handleLog);
-    proc.stderr.on('data', handleLog);
-
+    proc.stdout.on('data', onLog);
+    proc.stderr.on('data', onLog);
     proc.on('error', (err) => {
       if (tunnelProc === proc) {
         tunnelStatus = 'error';
         lastTunnelError = `Falha ao iniciar cloudflared: ${err.message}`;
       }
     });
-
     proc.on('close', (code) => {
       if (tunnelProc === proc) {
         tunnelProc = null;
-        if (tunnelStatus !== 'error') {
-          tunnelStatus = 'disconnected';
-        }
+        if (tunnelStatus !== 'error') tunnelStatus = 'disconnected';
         if (code && code !== 0 && !lastTunnelError) {
           tunnelStatus = 'error';
-          lastTunnelError = `Túnel encerrado (código ${code}). Verifique o token na sua conta Cloudflare.`;
+          lastTunnelError = `Túnel encerrado (código ${code}).`;
         }
       }
     });
   } catch (err: any) {
     tunnelStatus = 'error';
-    lastTunnelError = err?.message || 'Erro ao iniciar processo cloudflared.';
-  }
-}
-
-async function resolveCloudflaredBinarySafe(): Promise<string> {
-  try {
-    return await resolveCloudflaredBin();
-  } catch {
-    return 'cloudflared';
+    lastTunnelError = err?.message || 'Erro ao iniciar cloudflared.';
   }
 }
 
 function getTunnelInfo() {
-  const settings = readSettings();
-  const activeUrl =
-    settings.tunnelMode === 'custom'
-      ? settings.publicDomain
-      : settings.tunnelMode === 'quick'
-      ? quickTunnelUrl
-      : '';
-
+  const s = readSettings();
   return {
-    mode: settings.tunnelMode,
+    mode: s.tunnelMode,
     status: tunnelStatus,
-    publicDomain: settings.publicDomain,
+    publicDomain: s.publicDomain,
     quickTunnelUrl,
-    activeUrl,
-    hasToken: Boolean(settings.tunnelToken),
+    activeUrl: s.tunnelMode === 'custom' ? s.publicDomain : s.tunnelMode === 'quick' ? quickTunnelUrl : '',
+    hasToken: Boolean(s.tunnelToken),
     lastError: lastTunnelError || undefined,
   };
 }
 
-interface QualityOptionItem {
-  id: string;
-  label: string;
-  resolution?: string;
-  format: 'mp4' | 'mp3' | 'jpg' | 'jpeg' | 'png' | 'webp';
-  type: 'video' | 'audio' | 'image';
-  size?: string;
-  url: string;
-  hasWatermark: boolean;
-  isDirectStream?: boolean;
+// ================= MEDIA EXTRACTORS ================= //
+function detectPlatform(urlStr: string): 'youtube' | 'instagram' | 'tiktok' | 'pinterest' | 'generic' {
+  const u = urlStr.trim().toLowerCase();
+  if (u.includes('youtube.com') || u.includes('youtu.be')) return 'youtube';
+  if (u.includes('instagram.com') || u.includes('instagr.am')) return 'instagram';
+  if (u.includes('tiktok.com') || u.includes('douyin.com')) return 'tiktok';
+  if (u.includes('pinterest.com') || u.includes('pin.it')) return 'pinterest';
+  return 'generic';
 }
 
-// Helper: Extract metadata JSON using yt-dlp (automatically uses cookies.txt if present)
+function sanitizeFilename(name: string, maxLen = 45): string {
+  return (name || 'media').replace(/[\\/:*?"<>|]/g, '_').slice(0, maxLen).trim();
+}
+
 async function runYtDlpJson(targetUrl: string): Promise<any | null> {
   return new Promise((resolve) => {
-    const args: string[] = ['--dump-single-json', '--no-warnings', '--no-playlist'];
-    if (fs.existsSync(COOKIES_FILE)) {
-      args.push('--cookies', COOKIES_FILE);
-    }
+    const args = ['--dump-single-json', '--no-warnings', '--no-playlist'];
+    if (fs.existsSync(COOKIES_FILE)) args.push('--cookies', COOKIES_FILE);
     args.push(targetUrl);
 
     let stdout = '';
     const proc = spawn('yt-dlp', args);
-
     const timer = setTimeout(() => {
       try {
         proc.kill('SIGTERM');
       } catch {}
       resolve(null);
-    }, 20000);
+    }, 15000);
 
-    proc.stdout.on('data', (chunk) => {
-      stdout += chunk.toString();
-    });
-
+    proc.stdout.on('data', (d) => (stdout += d.toString()));
     proc.on('error', () => {
       clearTimeout(timer);
       resolve(null);
     });
-
     proc.on('close', (code) => {
       clearTimeout(timer);
       if (code === 0 && stdout.trim()) {
         try {
-          const parsed = JSON.parse(stdout.trim());
-          resolve(parsed);
-          return;
+          return resolve(JSON.parse(stdout.trim()));
         } catch {}
       }
       resolve(null);
@@ -352,121 +314,101 @@ async function runYtDlpJson(targetUrl: string): Promise<any | null> {
   });
 }
 
-// Platform Detection Helper
-function detectPlatform(urlStr: string): 'youtube' | 'instagram' | 'tiktok' | 'pinterest' | 'generic' {
-  const url = urlStr.trim().toLowerCase();
-  if (url.includes('youtube.com') || url.includes('youtu.be')) return 'youtube';
-  if (url.includes('instagram.com') || url.includes('instagr.am')) return 'instagram';
-  if (url.includes('tiktok.com') || url.includes('douyin.com')) return 'tiktok';
-  if (url.includes('pinterest.com') || url.includes('pin.it')) return 'pinterest';
-  return 'generic';
-}
-
-// Extractor: YouTube
-async function extractYouTube(url: string) {
-  let videoId = '';
-  const ytRegex = /(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/;
-  const match = url.match(ytRegex);
-  if (match && match[1]) {
-    videoId = match[1];
-  }
+// 1. YouTube
+async function extractYouTube(rawUrl: string) {
+  const match = rawUrl.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  const videoId = match?.[1] || '';
+  const isShorts = rawUrl.includes('/shorts/');
+  const canonicalUrl = normalizeCacheUrl(rawUrl);
 
   let title = 'YouTube Video';
   let author = 'YouTube Creator';
   let authorUrl = '';
-  let thumbnail = videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : '';
+  const thumbnail = videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : '';
 
   try {
-    const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
-    const res = await fetch(oembedUrl);
+    const res = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(canonicalUrl)}&format=json`);
     if (res.ok) {
       const data = await res.json();
       title = data.title || title;
       author = data.author_name || author;
       authorUrl = data.author_url || '';
-      if (data.thumbnail_url) {
-        thumbnail = data.thumbnail_url;
-      }
     }
-  } catch (e) {
-    console.warn('YouTube oembed fetch failed:', e);
-  }
+  } catch {}
 
-  if (videoId) {
-    thumbnail = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-  }
+  const cleanTitle = sanitizeFilename(title);
+  const makeDlUrl = (q: string, ext: string, type: 'video' | 'audio') =>
+    `/api/download?url=${encodeURIComponent(canonicalUrl)}&type=${type}&quality=${q}&filename=${encodeURIComponent(`${cleanTitle}_${q}.${ext}`)}&platform=youtube`;
 
-  // Construct direct stream URLs and formats
-  const cleanId = videoId || 'video';
   const qualities: QualityOptionItem[] = [
     {
       id: 'yt-1080p',
       label: '1080p Full HD (MP4)',
       resolution: '1920x1080',
-      format: 'mp4' as const,
-      type: 'video' as const,
+      format: 'mp4',
+      type: 'video',
       size: '~45 MB',
-      url: `/api/download?url=${encodeURIComponent(url)}&type=video&quality=1080&filename=${encodeURIComponent(title + '_1080p.mp4')}&platform=youtube`,
+      url: makeDlUrl('1080', 'mp4', 'video'),
       hasWatermark: false,
     },
     {
       id: 'yt-720p',
-      label: '720p HD (MP4)',
+      label: '720p HD Rápido (MP4)',
       resolution: '1280x720',
-      format: 'mp4' as const,
-      type: 'video' as const,
-      size: '~24 MB',
-      url: `/api/download?url=${encodeURIComponent(url)}&type=video&quality=720&filename=${encodeURIComponent(title + '_720p.mp4')}&platform=youtube`,
+      format: 'mp4',
+      type: 'video',
+      size: '~22 MB',
+      url: makeDlUrl('720', 'mp4', 'video'),
       hasWatermark: false,
     },
     {
       id: 'yt-480p',
-      label: '480p SD (MP4)',
+      label: '480p SD Leve (MP4)',
       resolution: '854x480',
-      format: 'mp4' as const,
-      type: 'video' as const,
+      format: 'mp4',
+      type: 'video',
       size: '~12 MB',
-      url: `/api/download?url=${encodeURIComponent(url)}&type=video&quality=480&filename=${encodeURIComponent(title + '_480p.mp4')}&platform=youtube`,
+      url: makeDlUrl('480', 'mp4', 'video'),
       hasWatermark: false,
     },
     {
       id: 'yt-audio',
       label: 'Áudio MP3 (320 kbps)',
       resolution: 'Áudio Estéreo',
-      format: 'mp3' as const,
-      type: 'audio' as const,
-      size: '~6 MB',
-      url: `/api/download?url=${encodeURIComponent(url)}&type=audio&quality=mp3&filename=${encodeURIComponent(title + '_audio.mp3')}&platform=youtube`,
+      format: 'mp3',
+      type: 'audio',
+      size: '~5 MB',
+      url: makeDlUrl('mp3', 'mp3', 'audio'),
       hasWatermark: false,
     },
     {
       id: 'yt-thumb',
       label: 'Capa Miniatura HD (JPG)',
       resolution: '1280x720',
-      format: 'jpg' as const,
-      type: 'image' as const,
+      format: 'jpg',
+      type: 'image',
       size: '~350 KB',
-      url: `/api/download?url=${encodeURIComponent(thumbnail)}&type=image&filename=${encodeURIComponent(title + '_cover.jpg')}&platform=youtube`,
+      url: `/api/download?url=${encodeURIComponent(thumbnail)}&type=image&filename=${encodeURIComponent(`${cleanTitle}_cover.jpg`)}&platform=youtube`,
       hasWatermark: false,
     },
   ];
 
   return {
-    id: cleanId,
-    originalUrl: url,
+    id: videoId || `yt-${Date.now()}`,
+    originalUrl: rawUrl,
     platform: 'youtube' as const,
-    mediaType: url.includes('/shorts/') ? ('video' as const) : ('video' as const),
+    mediaType: 'video' as const,
     title,
     author,
     authorUrl,
     thumbnail,
-    duration: url.includes('/shorts/') ? '0:58' : '3:45',
-    description: `Vídeo do YouTube extraído sem perdas para homelab.`,
+    duration: isShorts ? '0:58' : '3:45',
+    description: 'Vídeo do YouTube com download paralelo (-N 8) e cache inteligente de 10 min.',
     qualities,
   };
 }
 
-// Extractor: TikTok
+// 2. TikTok
 async function extractTikTok(url: string) {
   let title = 'TikTok Vídeo';
   let author = 'tiktok_user';
@@ -478,18 +420,12 @@ async function extractTikTok(url: string) {
   let duration = '0:30';
 
   try {
-    // Query TikWM API for watermark-free stream
-    const tikwmApi = `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}&hd=1`;
-    const res = await fetch(tikwmApi, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
+    const res = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}&hd=1`, {
+      headers: { 'User-Agent': USER_AGENT },
     });
-
     if (res.ok) {
-      const data = await res.json();
-      if (data && data.data) {
-        const item = data.data;
+      const { data: item } = await res.json();
+      if (item) {
         title = item.title || title;
         author = item.author?.unique_id ? `@${item.author.unique_id}` : item.author?.nickname || author;
         authorAvatar = item.author?.avatar || '';
@@ -497,34 +433,33 @@ async function extractTikTok(url: string) {
         videoNoWatermark = item.play || '';
         videoHd = item.hdplay || item.play || '';
         musicUrl = item.music || '';
-        duration = item.duration ? `${Math.floor(item.duration / 60)}:${(item.duration % 60).toString().padStart(2, '0')}` : duration;
+        if (item.duration) {
+          duration = `${Math.floor(item.duration / 60)}:${(item.duration % 60).toString().padStart(2, '0')}`;
+        }
       }
     }
-  } catch (err) {
-    console.warn('TikWM API failed, falling back:', err);
-  }
+  } catch {}
 
-  const cleanTitle = title.slice(0, 50).replace(/[\\/:*?"<>|]/g, '_');
-
+  const cleanTitle = sanitizeFilename(title, 50);
   const qualities: QualityOptionItem[] = [
     {
       id: 'tt-hd',
-      label: 'Vídeo HD Sem Marca d\'Água (MP4)',
+      label: "Vídeo HD Sem Marca d'Água (MP4)",
       resolution: '1080p HD',
-      format: 'mp4' as const,
-      type: 'video' as const,
+      format: 'mp4',
+      type: 'video',
       size: '~18 MB',
-      url: `/api/download?url=${encodeURIComponent(videoHd || videoNoWatermark || url)}&filename=${encodeURIComponent(cleanTitle + '_NoWatermark_HD.mp4')}&platform=tiktok`,
+      url: `/api/download?url=${encodeURIComponent(videoHd || videoNoWatermark || url)}&filename=${encodeURIComponent(`${cleanTitle}_HD.mp4`)}&platform=tiktok`,
       hasWatermark: false,
     },
     {
       id: 'tt-sd',
-      label: 'Vídeo Sem Marca d\'Água Padrão (MP4)',
+      label: "Vídeo Sem Marca d'Água Padrão (MP4)",
       resolution: '720p',
-      format: 'mp4' as const,
-      type: 'video' as const,
+      format: 'mp4',
+      type: 'video',
       size: '~9 MB',
-      url: `/api/download?url=${encodeURIComponent(videoNoWatermark || url)}&filename=${encodeURIComponent(cleanTitle + '_NoWatermark.mp4')}&platform=tiktok`,
+      url: `/api/download?url=${encodeURIComponent(videoNoWatermark || url)}&filename=${encodeURIComponent(`${cleanTitle}_SD.mp4`)}&platform=tiktok`,
       hasWatermark: false,
     },
   ];
@@ -534,10 +469,10 @@ async function extractTikTok(url: string) {
       id: 'tt-audio',
       label: 'Áudio Original TikTok (MP3)',
       resolution: 'Áudio MP3',
-      format: 'mp3' as const,
-      type: 'audio' as const,
-      size: '~3.2 MB',
-      url: `/api/download?url=${encodeURIComponent(musicUrl)}&filename=${encodeURIComponent(cleanTitle + '_audio.mp3')}&platform=tiktok`,
+      format: 'mp3',
+      type: 'audio',
+      size: '~3 MB',
+      url: `/api/download?url=${encodeURIComponent(musicUrl)}&filename=${encodeURIComponent(`${cleanTitle}_audio.mp3`)}&platform=tiktok`,
       hasWatermark: false,
     });
   }
@@ -547,10 +482,10 @@ async function extractTikTok(url: string) {
       id: 'tt-cover',
       label: 'Capa / Thumbnail (JPG)',
       resolution: 'Original',
-      format: 'jpg' as const,
-      type: 'image' as const,
+      format: 'jpg',
+      type: 'image',
       size: '~250 KB',
-      url: `/api/download?url=${encodeURIComponent(thumbnail)}&filename=${encodeURIComponent(cleanTitle + '_cover.jpg')}&platform=tiktok`,
+      url: `/api/download?url=${encodeURIComponent(thumbnail)}&filename=${encodeURIComponent(`${cleanTitle}_cover.jpg`)}&platform=tiktok`,
       hasWatermark: false,
     });
   }
@@ -563,20 +498,18 @@ async function extractTikTok(url: string) {
     title,
     author,
     authorAvatar,
-    thumbnail: thumbnail || 'https://images.unsplash.com/photo-1611162618071-b39a2ec055fb?w=800&auto=format&fit=crop&q=80',
+    thumbnail,
     duration,
-    description: 'Vídeo do TikTok extraído limpo e sem marca d\'água.',
+    description: "Vídeo do TikTok extraído sem marca d'água.",
     qualities,
   };
 }
 
-// Extractor: Instagram
+// 3. Instagram
 async function extractInstagram(url: string) {
-  // Clean URL: remove tracking query parameters like ?igsh=, ?utm_source=
   const cleanUrl = url.split('?')[0].replace(/\/+$/, '');
-  const match = cleanUrl.match(/\/(?:p|reel|reels|tv)\/([a-zA-Z0-9_-]+)/);
-  const shortcode = match ? match[1] : '';
-  const isReel = cleanUrl.includes('/reel/') || cleanUrl.includes('/reels/') || cleanUrl.includes('/tv/');
+  const shortcode = cleanUrl.match(/\/(?:p|reel|reels|tv)\/([a-zA-Z0-9_-]+)/)?.[1] || '';
+  const isReel = /\/(reel|reels|tv)\//.test(cleanUrl);
   const canonicalUrl = shortcode
     ? `https://www.instagram.com/${cleanUrl.includes('/p/') ? 'p' : 'reel'}/${shortcode}/`
     : cleanUrl;
@@ -587,117 +520,51 @@ async function extractInstagram(url: string) {
   let imageUrl = '';
   let duration = isReel ? '0:30' : undefined;
 
-  // 1. Primary Method: Extract via yt-dlp with cookies.txt support
   const ytInfo = await runYtDlpJson(canonicalUrl);
   if (ytInfo) {
-    const rawTitle = ytInfo.title || ytInfo.description || title;
-    title = rawTitle.split('\n')[0].slice(0, 70).trim() || title;
-
+    title = (ytInfo.title || ytInfo.description || title).split('\n')[0].slice(0, 70).trim() || title;
     const rawAuthor = ytInfo.channel || ytInfo.uploader || ytInfo.uploader_id;
-    if (rawAuthor) {
-      author = `@${String(rawAuthor).replace(/^@/, '')}`;
-    }
-
+    if (rawAuthor) author = `@${String(rawAuthor).replace(/^@/, '')}`;
     if (typeof ytInfo.duration === 'number' && ytInfo.duration > 0) {
-      const mins = Math.floor(ytInfo.duration / 60);
-      const secs = Math.floor(ytInfo.duration % 60);
-      duration = `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+      duration = `${Math.floor(ytInfo.duration / 60)}:${Math.floor(ytInfo.duration % 60).toString().padStart(2, '0')}`;
     }
-
-    if (ytInfo.thumbnail) {
-      rawThumbnail = ytInfo.thumbnail;
-    } else if (Array.isArray(ytInfo.thumbnails) && ytInfo.thumbnails.length > 0) {
-      rawThumbnail = ytInfo.thumbnails[ytInfo.thumbnails.length - 1].url || '';
-    } else if (Array.isArray(ytInfo.entries) && ytInfo.entries.length > 0) {
-      const firstEntry = ytInfo.entries[0];
-      rawThumbnail = firstEntry.thumbnail || '';
-    }
-
-    // Check if there is a direct high-res image URL (e.g. photo post or cover)
+    rawThumbnail =
+      ytInfo.thumbnail ||
+      ytInfo.thumbnails?.[ytInfo.thumbnails.length - 1]?.url ||
+      ytInfo.entries?.[0]?.thumbnail ||
+      '';
     if (ytInfo.ext === 'jpg' || ytInfo.ext === 'jpeg' || (!ytInfo.duration && ytInfo.url && !ytInfo.url.includes('.mp4'))) {
       imageUrl = ytInfo.url;
     } else if (Array.isArray(ytInfo.entries)) {
-      const imgEntry = ytInfo.entries.find((e: any) => e.ext === 'jpg' || e.ext === 'jpeg' || !e.duration);
-      if (imgEntry?.url) imageUrl = imgEntry.url;
+      imageUrl = ytInfo.entries.find((e: any) => e.ext === 'jpg' || e.ext === 'jpeg' || !e.duration)?.url || '';
     }
-    if (!imageUrl && rawThumbnail) {
-      imageUrl = rawThumbnail;
-    }
+    if (!imageUrl && rawThumbnail) imageUrl = rawThumbnail;
   }
 
-  // 2. Fallback Method: Scrape Instagram's public /embed/captioned/ page if yt-dlp had no thumbnail
   if (!rawThumbnail && shortcode) {
     try {
-      const embedUrl = `https://www.instagram.com/p/${shortcode}/embed/captioned/`;
-      const embedRes = await fetch(embedUrl, {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        },
+      const embedRes = await fetch(`https://www.instagram.com/p/${shortcode}/embed/captioned/`, {
+        headers: { 'User-Agent': USER_AGENT },
       });
       if (embedRes.ok) {
         const html = await embedRes.text();
         const imgMatch =
           html.match(/class="EmbeddedMediaImage"[^>]+src="([^"]+)"/i) ||
-          html.match(/<img[^>]+class="[^"]*EmbeddedMediaImage[^"]*"[^>]+src="([^"]+)"/i) ||
           html.match(/"display_url"\s*:\s*"([^"]+)"/i);
-        if (imgMatch && imgMatch[1]) {
+        if (imgMatch?.[1]) {
           rawThumbnail = imgMatch[1].replace(/&amp;/g, '&').replace(/\\u0026/g, '&').replace(/\\\//g, '/');
           imageUrl = rawThumbnail;
         }
         const userMatch = html.match(/class="UsernameText"[^>]*>([^<]+)</i);
-        if (userMatch && userMatch[1]) {
-          author = `@${userMatch[1].trim().replace(/^@/, '')}`;
-        }
+        if (userMatch?.[1]) author = `@${userMatch[1].trim().replace(/^@/, '')}`;
       }
-    } catch (err) {
-      console.warn('Instagram embed fallback error:', err);
-    }
+    } catch {}
   }
 
-  // Proxy thumbnail through our local backend so Instagram's Cross-Origin-Resource-Policy header never blocks <img> rendering
-  const fallbackCover = 'https://images.unsplash.com/photo-1611262588024-d12430b98920?w=800&auto=format&fit=crop&q=80';
   const displayThumbnail = rawThumbnail
     ? `/api/download?url=${encodeURIComponent(rawThumbnail)}&type=image&filename=thumbnail.jpeg&platform=instagram&inline=1`
-    : fallbackCover;
-
-  const cleanTitle = (title || (isReel ? 'Instagram_Reel' : 'Instagram_Post'))
-    .replace(/[\\/:*?"<>|]/g, '_')
-    .slice(0, 45);
-
-  const qualities: QualityOptionItem[] = [
-    {
-      id: 'ig-video-hd',
-      label: isReel ? 'Vídeo Reel Sem Marca d\'Água (MP4 HD)' : 'Vídeo MP4 Alta Qualidade',
-      resolution: '1080p HD',
-      format: 'mp4' as const,
-      type: 'video' as const,
-      size: '~12 MB',
-      url: `/api/download?url=${encodeURIComponent(canonicalUrl)}&type=video&quality=1080&filename=${encodeURIComponent(cleanTitle + '.mp4')}&platform=instagram`,
-      hasWatermark: false,
-    },
-    {
-      id: 'ig-image-jpeg',
-      label: 'Imagem / Foto em Resolução Máxima (JPEG)',
-      resolution: 'Original 1080p',
-      format: 'jpeg' as const,
-      type: 'image' as const,
-      size: '~1.5 MB',
-      url: `/api/download?url=${encodeURIComponent(imageUrl || rawThumbnail || canonicalUrl)}&type=image&filename=${encodeURIComponent(cleanTitle + '.jpeg')}&platform=instagram`,
-      hasWatermark: false,
-    },
-    {
-      id: 'ig-audio',
-      label: 'Áudio Extraído do Reel / Vídeo (MP3)',
-      resolution: 'Áudio Estéreo',
-      format: 'mp3' as const,
-      type: 'audio' as const,
-      size: '~2.8 MB',
-      url: `/api/download?url=${encodeURIComponent(canonicalUrl)}&type=audio&filename=${encodeURIComponent(cleanTitle + '_audio.mp3')}&platform=instagram`,
-      hasWatermark: false,
-    },
-  ];
+    : '';
+  const cleanTitle = sanitizeFilename(title);
 
   return {
     id: `ig-${shortcode || Date.now()}`,
@@ -708,12 +575,43 @@ async function extractInstagram(url: string) {
     author,
     thumbnail: displayThumbnail,
     duration,
-    description: isReel ? 'Reel do Instagram extraído via yt-dlp em MP4.' : 'Publicação do Instagram extraída em alta definição.',
-    qualities,
+    description: isReel ? 'Reel do Instagram extraído via yt-dlp em MP4.' : 'Publicação do Instagram em alta definição.',
+    qualities: [
+      {
+        id: 'ig-video-hd',
+        label: isReel ? "Vídeo Reel Sem Marca d'Água (MP4 HD)" : 'Vídeo MP4 Alta Qualidade',
+        resolution: '1080p HD',
+        format: 'mp4' as const,
+        type: 'video' as const,
+        size: '~12 MB',
+        url: `/api/download?url=${encodeURIComponent(canonicalUrl)}&type=video&quality=1080&filename=${encodeURIComponent(`${cleanTitle}.mp4`)}&platform=instagram`,
+        hasWatermark: false,
+      },
+      {
+        id: 'ig-image-jpeg',
+        label: 'Imagem / Foto em Resolução Máxima (JPEG)',
+        resolution: 'Original 1080p',
+        format: 'jpeg' as const,
+        type: 'image' as const,
+        size: '~1.5 MB',
+        url: `/api/download?url=${encodeURIComponent(imageUrl || rawThumbnail || canonicalUrl)}&type=image&filename=${encodeURIComponent(`${cleanTitle}.jpeg`)}&platform=instagram`,
+        hasWatermark: false,
+      },
+      {
+        id: 'ig-audio',
+        label: 'Áudio Extraído do Reel / Vídeo (MP3)',
+        resolution: 'Áudio Estéreo',
+        format: 'mp3' as const,
+        type: 'audio' as const,
+        size: '~2.8 MB',
+        url: `/api/download?url=${encodeURIComponent(canonicalUrl)}&type=audio&filename=${encodeURIComponent(`${cleanTitle}_audio.mp3`)}&platform=instagram`,
+        hasWatermark: false,
+      },
+    ],
   };
 }
 
-// Extractor: Pinterest
+// 4. Pinterest
 async function extractPinterest(url: string) {
   let title = 'Pinterest Pin';
   let author = 'Pinterest Creator';
@@ -722,36 +620,22 @@ async function extractPinterest(url: string) {
   let videoUrl = '';
   let thumbnail = '';
 
-  const decodeHtmlEntities = (str: string) =>
-    str
-      .replace(/&amp;/g, '&')
-      .replace(/&quot;/g, '"')
-      .replace(/&#x27;/g, "'")
-      .replace(/&#39;/g, "'")
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>');
+  const decodeEntities = (s: string) =>
+    s.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
 
   const extractMeta = (html: string, prop: string): string => {
-    const escaped = prop.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regexPropFirst = new RegExp(
-      `<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']+)["']`,
-      'i'
-    );
-    const regexContentFirst = new RegExp(
-      `<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${escaped}["']`,
-      'i'
-    );
-    const match = html.match(regexPropFirst) || html.match(regexContentFirst);
-    return match && match[1] ? decodeHtmlEntities(match[1].trim()) : '';
+    const esc = prop.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const m =
+      html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${esc}["'][^>]+content=["']([^"']+)["']`, 'i')) ||
+      html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${esc}["']`, 'i'));
+    return m?.[1] ? decodeEntities(m[1].trim()) : '';
   };
 
   try {
-    // Resolve short pin.it URLs and localized pinterest domains (e.g., br.pinterest.com)
     const res = await fetch(url, {
       redirect: 'follow',
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        'User-Agent': USER_AGENT,
         Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
       },
@@ -759,97 +643,50 @@ async function extractPinterest(url: string) {
 
     if (res.ok) {
       const html = await res.text();
+      const rawTitle = extractMeta(html, 'og:title') || extractMeta(html, 'twitter:title') || html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1] || '';
+      if (rawTitle) title = decodeEntities(rawTitle).replace(/\s*\|\s*Pinterest$/i, '').trim();
 
-      // 1. Extract Title
-      const rawTitle =
-        extractMeta(html, 'og:title') ||
-        extractMeta(html, 'twitter:title') ||
-        (html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1] ?? '');
-      if (rawTitle) {
-        title = decodeHtmlEntities(rawTitle).replace(/\s*\|\s*Pinterest$/i, '').trim();
-      }
-
-      // 2. Extract Description
       const rawDesc = extractMeta(html, 'og:description') || extractMeta(html, 'twitter:description');
-      if (rawDesc) {
-        description = rawDesc;
-      }
+      if (rawDesc) description = rawDesc;
 
-      // 3. Extract Author / Pinner
       const pinnerMatch =
         html.match(/"pinner"\s*:\s*\{[^}]*"full_name"\s*:\s*"([^"]+)"/i) ||
-        html.match(/"pinner"\s*:\s*\{[^}]*"username"\s*:\s*"([^"]+)"/i) ||
-        html.match(/"native_creator"\s*:\s*\{[^}]*"full_name"\s*:\s*"([^"]+)"/i);
-      if (pinnerMatch && pinnerMatch[1]) {
-        author = pinnerMatch[1].replace(/\\u[\dA-Fa-f]{4}/g, (m) =>
-          String.fromCharCode(parseInt(m.slice(2), 16))
-        );
+        html.match(/"pinner"\s*:\s*\{[^}]*"username"\s*:\s*"([^"]+)"/i);
+      if (pinnerMatch?.[1]) {
+        author = pinnerMatch[1].replace(/\\u[\dA-Fa-f]{4}/g, (m) => String.fromCharCode(parseInt(m.slice(2), 16)));
       }
 
-      // 4. Extract Pin Image URL from meta tags (handles both content-first and property-first attributes)
-      const metaImage =
-        extractMeta(html, 'og:image') ||
-        extractMeta(html, 'twitter:image:src') ||
-        extractMeta(html, 'twitter:image');
-
+      const metaImage = extractMeta(html, 'og:image') || extractMeta(html, 'twitter:image:src') || extractMeta(html, 'twitter:image');
       if (metaImage) {
         thumbnail = metaImage;
-
-        // Extract the unique pin asset hash path (e.g. "78/01/d1/7801d169ae06e290c2bd2df4076276d6")
-        const hashMatch = metaImage.match(/pinimg\.com\/(?:[^/]+)\/([0-9a-f]{2}\/[0-9a-f]{2}\/[0-9a-f]{2}\/[0-9a-f]+)/i);
-        if (hashMatch && hashMatch[1]) {
-          const hashPath = hashMatch[1];
-          const escapedHash = hashPath.replace(/\//g, '\\/');
-          const exactOrigRegex = new RegExp(
-            `https:\\/\\/i\\.pinimg\\.com\\/originals\\/${escapedHash}\\.(?:jpg|jpeg|png|gif|webp)`,
-            'i'
+        const hashPath = metaImage.match(/pinimg\.com\/(?:[^/]+)\/([0-9a-f]{2}\/[0-9a-f]{2}\/[0-9a-f]{2}\/[0-9a-f]+)/i)?.[1];
+        if (hashPath) {
+          const origMatch = html.match(
+            new RegExp(`https:\\/\\/i\\.pinimg\\.com\\/originals\\/${hashPath.replace(/\//g, '\\/')}\\.(?:jpg|jpeg|png|gif|webp)`, 'i')
           );
-          const exactOrigMatch = html.match(exactOrigRegex);
-          if (exactOrigMatch && exactOrigMatch[0]) {
-            highResImage = exactOrigMatch[0];
-          }
+          if (origMatch?.[0]) highResImage = origMatch[0];
         }
-
         if (!highResImage) {
-          const candidateOrig = metaImage.replace(/\/(236x|474x|564x|736x|1200x|600x315)\//, '/originals/');
+          const candidate = metaImage.replace(/\/(236x|474x|564x|736x|1200x|600x315)\//, '/originals/');
           try {
-            const headRes = await fetch(candidateOrig, { method: 'HEAD' });
-            highResImage = headRes.ok ? candidateOrig : metaImage;
+            const head = await fetch(candidate, { method: 'HEAD' });
+            highResImage = head.ok ? candidate : metaImage;
           } catch {
-            highResImage = candidateOrig;
+            highResImage = candidate;
           }
         }
-      } else {
-        // Fallback: search for main 736x pinimg in page body if meta tags were omitted
-        const bodyImgMatch = html.match(/https:\/\/i\.pinimg\.com\/736x\/[0-9a-f/]+\.(?:jpg|jpeg|png|webp)/i);
-        if (bodyImgMatch && bodyImgMatch[0]) {
-          thumbnail = bodyImgMatch[0];
-          highResImage = thumbnail.replace('/736x/', '/originals/');
-        }
       }
 
-      // 5. Check if Pin is a Video Pin
-      const metaVideo =
-        extractMeta(html, 'og:video') ||
-        extractMeta(html, 'og:video:secure_url') ||
-        extractMeta(html, 'og:video:url') ||
-        extractMeta(html, 'twitter:player:stream');
-      const v1VideoMatch = html.match(/https:\/\/v1\.pinimg\.com\/videos\/[^"'\s<>\\]+\.mp4/i);
-      if (metaVideo && metaVideo.includes('.mp4')) {
-        videoUrl = metaVideo;
-      } else if (v1VideoMatch && v1VideoMatch[0]) {
-        videoUrl = v1VideoMatch[0].replace(/\\u002F/g, '/').replace(/\\\//g, '/');
-      }
+      const metaVideo = extractMeta(html, 'og:video') || extractMeta(html, 'og:video:secure_url') || extractMeta(html, 'twitter:player:stream');
+      const v1Video = html.match(/https:\/\/v1\.pinimg\.com\/videos\/[^"'\s<>\\]+\.mp4/i)?.[0];
+      if (metaVideo?.includes('.mp4')) videoUrl = metaVideo;
+      else if (v1Video) videoUrl = v1Video.replace(/\\u002F|\\\//g, '/');
     }
-  } catch (err) {
-    console.warn('Pinterest scrape error:', err);
-  }
+  } catch {}
 
-  if (!thumbnail) {
-    throw new Error('Não foi possível localizar a imagem ou vídeo deste Pin do Pinterest.');
-  }
+  if (!thumbnail) throw new Error('Não foi possível localizar a imagem ou vídeo deste Pin do Pinterest.');
 
-  const cleanTitle = (title || 'Pinterest_Pin').slice(0, 45).replace(/[\\/:*?"<>|]/g, '_');
+  const cleanTitle = sanitizeFilename(title);
   const qualities: QualityOptionItem[] = [];
 
   if (videoUrl) {
@@ -857,35 +694,36 @@ async function extractPinterest(url: string) {
       id: 'pin-video-hd',
       label: 'Vídeo do Pin HD (MP4)',
       resolution: 'Original HD',
-      format: 'mp4' as const,
-      type: 'video' as const,
+      format: 'mp4',
+      type: 'video',
       size: '~12 MB',
-      url: `/api/download?url=${encodeURIComponent(videoUrl)}&type=video&filename=${encodeURIComponent(cleanTitle + '.mp4')}&platform=pinterest`,
+      url: `/api/download?url=${encodeURIComponent(videoUrl)}&type=video&filename=${encodeURIComponent(`${cleanTitle}.mp4`)}&platform=pinterest`,
       hasWatermark: false,
     });
   }
 
-  qualities.push({
-    id: 'pin-image-original',
-    label: 'Imagem Original Full Resolution (JPEG)',
-    resolution: 'Original (4K/HD)',
-    format: 'jpeg' as const,
-    type: 'image' as const,
-    size: '~3.2 MB',
-    url: `/api/download?url=${encodeURIComponent(highResImage || thumbnail)}&type=image&filename=${encodeURIComponent(cleanTitle + '_original.jpeg')}&platform=pinterest`,
-    hasWatermark: false,
-  });
-
-  qualities.push({
-    id: 'pin-image-standard',
-    label: 'Imagem Otimizada Web (736p JPEG)',
-    resolution: '736x Padrão',
-    format: 'jpeg' as const,
-    type: 'image' as const,
-    size: '~850 KB',
-    url: `/api/download?url=${encodeURIComponent(thumbnail)}&type=image&filename=${encodeURIComponent(cleanTitle + '_736x.jpeg')}&platform=pinterest`,
-    hasWatermark: false,
-  });
+  qualities.push(
+    {
+      id: 'pin-image-original',
+      label: 'Imagem Original Full Resolution (JPEG)',
+      resolution: 'Original (4K/HD)',
+      format: 'jpeg',
+      type: 'image',
+      size: '~3.2 MB',
+      url: `/api/download?url=${encodeURIComponent(highResImage || thumbnail)}&type=image&filename=${encodeURIComponent(`${cleanTitle}_original.jpeg`)}&platform=pinterest`,
+      hasWatermark: false,
+    },
+    {
+      id: 'pin-image-standard',
+      label: 'Imagem Otimizada Web (736p JPEG)',
+      resolution: '736x Padrão',
+      format: 'jpeg',
+      type: 'image',
+      size: '~850 KB',
+      url: `/api/download?url=${encodeURIComponent(thumbnail)}&type=image&filename=${encodeURIComponent(`${cleanTitle}_736x.jpeg`)}&platform=pinterest`,
+      hasWatermark: false,
+    }
+  );
 
   return {
     id: `pin-${Date.now()}`,
@@ -900,43 +738,40 @@ async function extractPinterest(url: string) {
   };
 }
 
-// Extractor: Generic / Direct Link
+// 5. Generic
 async function extractGeneric(url: string) {
-  const isVideo = url.endsWith('.mp4') || url.endsWith('.webm') || url.endsWith('.mov');
-  const isAudio = url.endsWith('.mp3') || url.endsWith('.m4a') || url.endsWith('.wav');
-  const isImage = url.endsWith('.jpg') || url.endsWith('.jpeg') || url.endsWith('.png') || url.endsWith('.webp');
-
+  const isVideo = /\.(mp4|webm|mov)(\?|$)/i.test(url);
+  const isAudio = /\.(mp3|m4a|wav)(\?|$)/i.test(url);
   const filename = url.split('/').pop()?.split('?')[0] || 'media_download';
-
-  const qualities: QualityOptionItem[] = [
-    {
-      id: 'generic-file',
-      label: `Download Direto (${isVideo ? 'Vídeo MP4' : isAudio ? 'Áudio MP3' : 'Imagem'})`,
-      resolution: 'Original',
-      format: (isVideo ? 'mp4' : isAudio ? 'mp3' : 'jpg') as any,
-      type: (isVideo ? 'video' : isAudio ? 'audio' : 'image') as any,
-      size: 'Direto',
-      url: `/api/download?url=${encodeURIComponent(url)}&filename=${encodeURIComponent(filename)}&platform=generic`,
-      hasWatermark: false,
-    },
-  ];
+  const format = (isVideo ? 'mp4' : isAudio ? 'mp3' : 'jpg') as 'mp4' | 'mp3' | 'jpg';
+  const type = (isVideo ? 'video' : isAudio ? 'audio' : 'image') as 'video' | 'audio' | 'image';
 
   return {
     id: `generic-${Date.now()}`,
     originalUrl: url,
     platform: 'generic' as const,
-    mediaType: (isVideo ? 'video' : isAudio ? 'audio' : 'image') as any,
+    mediaType: type,
     title: filename,
     author: new URL(url).hostname,
-    thumbnail: isImage ? url : 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800&auto=format&fit=crop&q=80',
-    description: 'Link direto analisado e pronto para streaming de download.',
-    qualities,
+    thumbnail: type === 'image' ? url : '',
+    description: 'Link direto analisado e pronto para download.',
+    qualities: [
+      {
+        id: 'generic-file',
+        label: `Download Direto (${type.toUpperCase()})`,
+        resolution: 'Original',
+        format,
+        type,
+        size: 'Direto',
+        url: `/api/download?url=${encodeURIComponent(url)}&filename=${encodeURIComponent(filename)}&platform=generic`,
+        hasWatermark: false,
+      },
+    ],
   };
 }
 
 // ================= API ENDPOINTS ================= //
 
-// 1. POST /api/extract
 app.post('/api/extract', async (req: Request, res: Response) => {
   try {
     const { url } = req.body;
@@ -944,31 +779,25 @@ app.post('/api/extract', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Informe uma URL válida para extração de mídia.' });
     }
 
-    const platform = detectPlatform(url);
-    let result;
-
-    switch (platform) {
-      case 'youtube':
-        result = await extractYouTube(url);
-        break;
-      case 'tiktok':
-        result = await extractTikTok(url);
-        break;
-      case 'instagram':
-        result = await extractInstagram(url);
-        break;
-      case 'pinterest':
-        result = await extractPinterest(url);
-        break;
-      case 'generic':
-      default:
-        result = await extractGeneric(url);
-        break;
+    const cacheKey = normalizeCacheUrl(url);
+    const cached = extractCache.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt) {
+      return res.json({ success: true, platform: cached.platform, data: cached.data, cached: true });
     }
 
-    return res.json({ success: true, platform, data: result });
+    const platform = detectPlatform(url);
+    const extractors = {
+      youtube: extractYouTube,
+      tiktok: extractTikTok,
+      instagram: extractInstagram,
+      pinterest: extractPinterest,
+      generic: extractGeneric,
+    };
+    const data = await extractors[platform](url);
+    extractCache.set(cacheKey, { platform, data, expiresAt: Date.now() + CACHE_TTL_MS });
+
+    return res.json({ success: true, platform, data });
   } catch (error: any) {
-    console.error('Error during media extraction:', error);
     return res.status(500).json({
       error: 'Não foi possível extrair a mídia desse link. Verifique se o link é público ou válido.',
       details: error?.message,
@@ -976,217 +805,152 @@ app.post('/api/extract', async (req: Request, res: Response) => {
   }
 });
 
-// 2. GET /api/download (Streaming Proxy for Homelab)
 app.get('/api/download', async (req: Request, res: Response) => {
   try {
-    const { url, filename = 'download', platform = 'generic', quality } = req.query as {
-      url: string;
-      filename?: string;
-      platform?: string;
-      quality?: string;
-    };
-
-    if (!url) {
-      return res.status(400).send('URL de download ausente.');
-    }
+    const { url, filename = 'download', platform = 'generic', quality } = req.query as Record<string, string>;
+    if (!url) return res.status(400).send('URL de download ausente.');
 
     let targetUrl = decodeURIComponent(url);
     const isInline = req.query.inline === '1';
+    const isVideoOrAudio = /\.(mp4|webm|mp3)$/i.test(filename) || req.query.type === 'video' || req.query.type === 'audio';
+    const isYtDlpPlatform = /(youtube\.com\/(watch|shorts)|youtu\.be\/|instagram\.com\/|instagr\.am\/)/i.test(targetUrl);
 
-    const isVideoOrAudio =
-      filename.endsWith('.mp4') ||
-      filename.endsWith('.webm') ||
-      filename.endsWith('.mp3') ||
-      req.query.type === 'video' ||
-      req.query.type === 'audio';
-
-    const isYtDlpPlatform =
-      targetUrl.includes('youtube.com/watch') ||
-      targetUrl.includes('youtu.be/') ||
-      targetUrl.includes('youtube.com/shorts') ||
-      targetUrl.includes('instagram.com/') ||
-      targetUrl.includes('instagr.am/');
-
-    // 1. YouTube & Instagram video or audio: download & remux via yt-dlp + ffmpeg into genuine MP4/MP3
+    // 1. Accelerated YouTube & Instagram video/audio download via yt-dlp (-N 8) + 10-min /tmp cache
     if (isYtDlpPlatform && isVideoOrAudio && !isInline) {
       const isAudio = filename.endsWith('.mp3') || req.query.type === 'audio';
       const ext = isAudio ? 'mp3' : 'mp4';
       const cleanFilename = filename.replace(/\.(webm|mp4|m4a|mp3|jpeg|jpg)$/i, '') + '.' + ext;
+      const targetRes = quality && ['1080', '720', '480'].includes(quality) ? quality : '1080';
 
-      const tempDir = fs.existsSync('/tmp') ? '/tmp' : os.tmpdir();
-      const tempPrefix = `uv-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      const tempFile = path.join(tempDir, `${tempPrefix}.${ext}`);
+      const canonicalTarget = normalizeCacheUrl(targetUrl);
+      const cacheKey = `${canonicalTarget}|${isAudio ? 'mp3' : targetRes}`;
+      const cacheHash = crypto.createHash('md5').update(cacheKey).digest('hex').slice(0, 14);
+      const cachedFilePath = path.join(TEMP_DIR, `uv-cache-${cacheHash}.${ext}`);
 
-      const cleanupTempFiles = () => {
-        try {
-          const files = fs.readdirSync(tempDir);
-          for (const f of files) {
-            if (f.startsWith(tempPrefix)) {
-              try {
-                fs.unlinkSync(path.join(tempDir, f));
-              } catch {}
-            }
-          }
-        } catch {}
-      };
-
-      let activeProc: ReturnType<typeof spawn> | null = null;
-      let clientClosed = false;
-
-      req.on('close', () => {
-        clientClosed = true;
-        if (activeProc) {
-          try {
-            activeProc.kill('SIGTERM');
-          } catch {}
-        }
-        cleanupTempFiles();
-      });
-
-      const executeYtDlpAttempt = (
-        useCookies: boolean,
-        useFormatSort: boolean
-      ): Promise<{ ok: boolean; file: string; err: string }> => {
-        return new Promise((resolve) => {
-          cleanupTempFiles();
-          const args: string[] = ['--no-warnings', '--no-playlist'];
-
-          if (useCookies && fs.existsSync(COOKIES_FILE)) {
-            args.push('--cookies', COOKIES_FILE);
-          }
-
-          if (isAudio) {
-            args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
-          } else {
-            if (useFormatSort) {
-              args.push('-f', 'bv*+ba/b');
-              const targetRes = quality && ['1080', '720', '480'].includes(quality) ? quality : '1080';
-              args.push('-S', `res:${targetRes},ext:mp4:m4a,vcodec:h264,acodec:aac`);
-            }
-            args.push('--merge-output-format', 'mp4');
-            args.push('--remux-video', 'mp4');
-          }
-
-          args.push('-o', tempFile);
-          args.push(targetUrl);
-
-          let errStr = '';
-          const proc = spawn('yt-dlp', args);
-          activeProc = proc;
-
-          proc.stderr.on('data', (d) => {
-            errStr += d.toString();
-          });
-
-          proc.on('error', (err) => {
-            resolve({ ok: false, file: '', err: err.message });
-          });
-
-          proc.on('close', (code) => {
-            let found = fs.existsSync(tempFile) ? tempFile : '';
-            if (!found) {
-              try {
-                const match = fs.readdirSync(tempDir).find((f) => f.startsWith(tempPrefix));
-                if (match) {
-                  found = path.join(tempDir, match);
-                }
-              } catch {}
-            }
-
-            if (code === 0 && found && fs.existsSync(found)) {
-              resolve({ ok: true, file: found, err: '' });
-            } else {
-              resolve({ ok: false, file: '', err: errStr });
-            }
-          });
-        });
-      };
-
-      const isInstagram = targetUrl.includes('instagram.com/') || targetUrl.includes('instagr.am/');
-      let attemptResult: { ok: boolean; file: string; err: string };
-
-      if (isInstagram) {
-        // Instagram: Try with cookies first (if present), fallback without format sort if needed
-        attemptResult = await executeYtDlpAttempt(true, true);
-        if (!attemptResult.ok && !clientClosed) {
-          attemptResult = await executeYtDlpAttempt(true, false);
-        }
-      } else {
-        // YouTube: Try without cookies first so yt-dlp uses fast unblocked mobile clients (ios/android_vr)
-        attemptResult = await executeYtDlpAttempt(false, true);
-
-        // Fallback 1: If video requires login/age-verification (+18) and cookies.txt exists, retry WITH cookies
-        if (!attemptResult.ok && !clientClosed && fs.existsSync(COOKIES_FILE)) {
-          attemptResult = await executeYtDlpAttempt(true, true);
-        }
-
-        // Fallback 2: If format selection was still restricted, retry without strict format filter
-        if (!attemptResult.ok && !clientClosed) {
-          attemptResult = await executeYtDlpAttempt(fs.existsSync(COOKIES_FILE), false);
-        }
-      }
-
-      if (clientClosed) {
-        cleanupTempFiles();
-        return;
-      }
-
-      if (attemptResult.ok && attemptResult.file && fs.existsSync(attemptResult.file)) {
-        const stat = fs.statSync(attemptResult.file);
+      const streamCachedFile = (filePath: string) => {
+        const stat = fs.statSync(filePath);
         res.setHeader('Content-Length', stat.size);
         res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
         res.setHeader(
           'Content-Disposition',
           `attachment; filename="${encodeURIComponent(cleanFilename)}"; filename*=UTF-8''${encodeURIComponent(cleanFilename)}`
         );
+        fs.createReadStream(filePath, { highWaterMark: 256 * 1024 }).pipe(res);
+      };
 
-        const fileStream = fs.createReadStream(attemptResult.file);
-        fileStream.pipe(res);
-
-        fileStream.on('close', cleanupTempFiles);
-        res.on('finish', cleanupTempFiles);
-        res.on('close', cleanupTempFiles);
-      } else {
-        cleanupTempFiles();
-        if (!res.headersSent) {
-          console.error(`yt-dlp falhou após tentativas: ${attemptResult.err}`);
-          res.status(403).send(
-            attemptResult.err ||
-              'Não foi possível baixar o vídeo em MP4. Verifique se os cookies do Instagram/YouTube estão salvos.'
-          );
-        }
+      // Instant cache hit (0.01s) if downloaded within the last 10 minutes
+      const existingCache = mediaFileCache.get(cacheKey);
+      if (existingCache && Date.now() < existingCache.expiresAt && fs.existsSync(existingCache.file)) {
+        existingCache.expiresAt = Date.now() + CACHE_TTL_MS;
+        streamCachedFile(existingCache.file);
+        return;
       }
 
+      // Deduplicate concurrent downloads of the same video + quality
+      let downloadPromise = inFlightDownloads.get(cacheKey);
+      if (!downloadPromise) {
+        const isInstagram = /instagram\.com|instagr\.am/i.test(canonicalTarget);
+
+        const runAttempt = (
+          useCookies: boolean,
+          useFormatSort: boolean
+        ): Promise<{ ok: boolean; file: string; err: string }> =>
+          new Promise((resolve) => {
+            try {
+              if (fs.existsSync(cachedFilePath)) fs.unlinkSync(cachedFilePath);
+            } catch {}
+
+            const args = [
+              '--no-warnings',
+              '--no-playlist',
+              '--no-mtime',
+              '--concurrent-fragments',
+              '8',
+              '--buffer-size',
+              '64K',
+            ];
+
+            if (!isInstagram && !useCookies) {
+              args.push('--extractor-args', 'youtube:player_client=ios,android_vr,web');
+            }
+            if (useCookies && fs.existsSync(COOKIES_FILE)) {
+              args.push('--cookies', COOKIES_FILE);
+            }
+
+            if (isAudio) {
+              args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
+            } else {
+              if (useFormatSort) {
+                args.push('-f', 'bv*+ba/b', '-S', `res:${targetRes},ext:mp4:m4a,vcodec:h264,acodec:aac`);
+              } else {
+                args.push('--remux-video', 'mp4');
+              }
+              args.push('--merge-output-format', 'mp4');
+            }
+
+            args.push('-o', cachedFilePath, canonicalTarget);
+
+            let errStr = '';
+            const proc = spawn('yt-dlp', args);
+            proc.stderr.on('data', (d) => (errStr += d.toString()));
+            proc.on('error', (err) => resolve({ ok: false, file: '', err: err.message }));
+            proc.on('close', (code) => {
+              if (code === 0 && fs.existsSync(cachedFilePath)) {
+                resolve({ ok: true, file: cachedFilePath, err: '' });
+              } else {
+                resolve({ ok: false, file: '', err: errStr });
+              }
+            });
+          });
+
+        downloadPromise = (async () => {
+          let r = await runAttempt(isInstagram, true);
+          if (!r.ok && !isInstagram && fs.existsSync(COOKIES_FILE)) {
+            r = await runAttempt(true, true);
+          }
+          if (!r.ok) {
+            r = await runAttempt(fs.existsSync(COOKIES_FILE), false);
+          }
+          if (r.ok && r.file) {
+            mediaFileCache.set(cacheKey, { file: r.file, expiresAt: Date.now() + CACHE_TTL_MS });
+          }
+          return r;
+        })().finally(() => {
+          inFlightDownloads.delete(cacheKey);
+        });
+
+        inFlightDownloads.set(cacheKey, downloadPromise);
+      }
+
+      const result = await downloadPromise;
+      if (res.writableEnded || res.destroyed) return;
+
+      if (result.ok && result.file && fs.existsSync(result.file)) {
+        streamCachedFile(result.file);
+      } else if (!res.headersSent) {
+        res.status(403).send(
+          result.err || 'Não foi possível baixar o vídeo em MP4. Verifique os cookies na aba Homelab.'
+        );
+      }
       return;
     }
 
-    // If user requested an Instagram image (.jpeg) but targetUrl is still the post page URL, resolve its CDN image via yt-dlp
+    // Resolve Instagram post URL to CDN image if needed
     if (
-      (req.query.type === 'image' || filename.endsWith('.jpeg') || filename.endsWith('.jpg')) &&
-      (targetUrl.includes('instagram.com/') || targetUrl.includes('instagr.am/')) &&
-      !targetUrl.includes('cdninstagram.com') &&
-      !targetUrl.includes('fbcdn.net')
+      (req.query.type === 'image' || /\.(jpeg|jpg)$/i.test(filename)) &&
+      /instagram\.com|instagr\.am/i.test(targetUrl) &&
+      !/cdninstagram\.com|fbcdn\.net/i.test(targetUrl)
     ) {
       const info = await runYtDlpJson(targetUrl);
-      if (info) {
-        const resolvedImg =
-          info.thumbnail ||
-          (Array.isArray(info.thumbnails) && info.thumbnails.length > 0
-            ? info.thumbnails[info.thumbnails.length - 1].url
-            : '') ||
-          info.url;
-        if (resolvedImg) {
-          targetUrl = resolvedImg;
-        }
-      }
+      const resolved = info?.thumbnail || info?.thumbnails?.[info.thumbnails.length - 1]?.url || info?.url;
+      if (resolved) targetUrl = resolved;
     }
 
-    // 2. Direct CDN files, thumbnails (.jpeg), and other media: stream directly via fetch
-    if (targetUrl.startsWith('http://') || targetUrl.startsWith('https://')) {
+    // 2. Direct CDN stream proxy
+    if (/^https?:\/\//i.test(targetUrl)) {
       const response = await fetch(targetUrl, {
         headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+          'User-Agent': USER_AGENT,
           Referer:
             platform === 'tiktok'
               ? 'https://www.tiktok.com/'
@@ -1203,17 +967,10 @@ app.get('/api/download', async (req: Request, res: Response) => {
       let contentType = response.headers.get('content-type') || 'application/octet-stream';
       const contentLength = response.headers.get('content-length');
 
-      // Prevent serving HTML login/challenge pages as media
-      if (
-        contentType.includes('text/html') &&
-        (filename.endsWith('.mp4') || filename.endsWith('.mp3') || filename.endsWith('.jpeg') || filename.endsWith('.jpg'))
-      ) {
-        return res
-          .status(403)
-          .send('A plataforma exigiu autenticação adicional. Salve os cookies da conta na aba Homelab.');
+      if (contentType.includes('text/html') && /\.(mp4|mp3|jpeg|jpg)$/i.test(filename)) {
+        return res.status(403).send('A plataforma exigiu autenticação adicional. Salve os cookies na aba Homelab.');
       }
-
-      if (filename.endsWith('.jpeg') || filename.endsWith('.jpg') || req.query.type === 'image') {
+      if (/\.(jpeg|jpg)$/i.test(filename) || req.query.type === 'image') {
         contentType = 'image/jpeg';
       }
 
@@ -1225,138 +982,75 @@ app.get('/api/download', async (req: Request, res: Response) => {
           ? 'inline'
           : `attachment; filename="${encodeURIComponent(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`
       );
-      if (contentLength) {
-        res.setHeader('Content-Length', contentLength);
-      }
+      if (contentLength) res.setHeader('Content-Length', contentLength);
 
-      // Convert web ReadableStream to Node stream and pipe to express response
-      const nodeStream = Readable.fromWeb(response.body as any);
-      nodeStream.pipe(res);
+      Readable.fromWeb(response.body as any).pipe(res);
       return;
     }
 
     return res.status(400).send('Formato de URL inválido.');
   } catch (error: any) {
-    console.error('Error streaming download:', error);
     return res.status(500).send('Erro ao realizar proxy do download: ' + error.message);
   }
 });
 
-// 3. GET /api/history (Get persistent downloads history)
-app.get('/api/history', (req: Request, res: Response) => {
-  try {
-    const history = readHistory();
-    return res.json({ success: true, data: history });
-  } catch (error: any) {
-    return res.status(500).json({ error: 'Erro ao carregar histórico', details: error.message });
-  }
+// History & Server Endpoints
+app.get('/api/history', (_req: Request, res: Response) => {
+  return res.json({ success: true, data: readHistory() });
 });
 
-// 4. POST /api/history (Add item to persistent downloads history)
 app.post('/api/history', (req: Request, res: Response) => {
-  try {
-    const item = req.body;
-    if (!item || !item.id || !item.title) {
-      return res.status(400).json({ error: 'Dados do histórico incompletos.' });
-    }
-
-    const history = readHistory();
-    // Prepend new download item (limit to last 200 items for clean homelab storage)
-    const filtered = history.filter((h: any) => h.id !== item.id);
-    const updated = [item, ...filtered].slice(0, 200);
-    writeHistory(updated);
-
-    return res.json({ success: true, count: updated.length });
-  } catch (error: any) {
-    return res.status(500).json({ error: 'Erro ao salvar histórico', details: error.message });
-  }
+  const item = req.body;
+  if (!item?.id || !item?.title) return res.status(400).json({ error: 'Dados incompletos.' });
+  const updated = [item, ...readHistory().filter((h: any) => h.id !== item.id)].slice(0, 200);
+  writeHistory(updated);
+  return res.json({ success: true, count: updated.length });
 });
 
-// 5. DELETE /api/history/:id (Remove single item from history)
 app.delete('/api/history/:id', (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const history = readHistory();
-    const updated = history.filter((h: any) => h.id !== id);
-    writeHistory(updated);
-    return res.json({ success: true, data: updated });
-  } catch (error: any) {
-    return res.status(500).json({ error: 'Erro ao remover item do histórico', details: error.message });
-  }
+  const updated = readHistory().filter((h: any) => h.id !== req.params.id);
+  writeHistory(updated);
+  return res.json({ success: true, data: updated });
 });
 
-// 6. DELETE /api/history (Clear entire history)
-app.delete('/api/history', (req: Request, res: Response) => {
-  try {
-    writeHistory([]);
-    return res.json({ success: true, message: 'Histórico limpo com sucesso.' });
-  } catch (error: any) {
-    return res.status(500).json({ error: 'Erro ao limpar histórico', details: error.message });
-  }
+app.delete('/api/history', (_req: Request, res: Response) => {
+  writeHistory([]);
+  return res.json({ success: true });
 });
 
-// 7. GET /api/server-info (Homelab diagnostics & health)
-app.get('/api/server-info', (req: Request, res: Response) => {
+app.get('/api/server-info', (_req: Request, res: Response) => {
   const mem = process.memoryUsage();
-  const formatMB = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-
-  const history = readHistory();
-
+  const mb = (b: number) => `${(b / 1024 / 1024).toFixed(1)} MB`;
   return res.json({
     status: 'online',
     uptime: Math.floor(process.uptime()),
-    memoryUsage: {
-      rss: formatMB(mem.rss),
-      heapTotal: formatMB(mem.heapTotal),
-      heapUsed: formatMB(mem.heapUsed),
-    },
+    memoryUsage: { rss: mb(mem.rss), heapTotal: mb(mem.heapTotal), heapUsed: mb(mem.heapUsed) },
     homelabReady: true,
     nodeVersion: process.version,
-    historyCount: history.length,
+    historyCount: readHistory().length,
     environment: process.env.NODE_ENV || 'development',
     cookies: getCookiesInfo(),
     tunnel: getTunnelInfo(),
   });
 });
 
-// 8. GET /api/cookies (Check status of cookies.txt)
-app.get('/api/cookies', (req: Request, res: Response) => {
+app.get('/api/cookies', (_req: Request, res: Response) => res.json(getCookiesInfo()));
+
+app.post('/api/cookies', (req: Request, res: Response) => {
+  const { content } = req.body;
+  if (typeof content !== 'string') return res.status(400).json({ error: 'Conteúdo inválido.' });
+  ensureDataStorage();
+  fs.writeFileSync(COOKIES_FILE, content.trim(), 'utf-8');
   return res.json(getCookiesInfo());
 });
 
-// 9. POST /api/cookies (Save or update cookies.txt)
-app.post('/api/cookies', (req: Request, res: Response) => {
-  try {
-    const { content } = req.body;
-    if (typeof content !== 'string') {
-      return res.status(400).json({ error: 'Conteúdo de cookies inválido.' });
-    }
-    ensureDataStorage();
-    fs.writeFileSync(COOKIES_FILE, content.trim(), 'utf-8');
-    return res.json(getCookiesInfo());
-  } catch (error: any) {
-    return res.status(500).json({ error: 'Erro ao salvar cookies.txt: ' + error.message });
-  }
+app.delete('/api/cookies', (_req: Request, res: Response) => {
+  if (fs.existsSync(COOKIES_FILE)) fs.unlinkSync(COOKIES_FILE);
+  return res.json({ success: true });
 });
 
-// 10. DELETE /api/cookies (Remove cookies.txt)
-app.delete('/api/cookies', (req: Request, res: Response) => {
-  try {
-    if (fs.existsSync(COOKIES_FILE)) {
-      fs.unlinkSync(COOKIES_FILE);
-    }
-    return res.json({ success: true, message: 'Arquivo cookies.txt removido com sucesso.' });
-  } catch (error: any) {
-    return res.status(500).json({ error: 'Erro ao remover cookies.txt' });
-  }
-});
+app.get('/api/tunnel', (_req: Request, res: Response) => res.json(getTunnelInfo()));
 
-// 11. GET /api/tunnel (Check Cloudflare Tunnel & custom domain status)
-app.get('/api/tunnel', (req: Request, res: Response) => {
-  return res.json(getTunnelInfo());
-});
-
-// 12. POST /api/tunnel (Save custom domain / Cloudflare token and start tunnel)
 app.post('/api/tunnel', async (req: Request, res: Response) => {
   try {
     const { mode, publicDomain, tunnelToken } = req.body as {
@@ -1364,76 +1058,50 @@ app.post('/api/tunnel', async (req: Request, res: Response) => {
       publicDomain?: string;
       tunnelToken?: string;
     };
-
     const current = readSettings();
     const updatedMode = mode || 'custom';
-    const updatedDomain =
-      typeof publicDomain === 'string' ? normalizeDomainInput(publicDomain) : current.publicDomain;
+    const updatedDomain = typeof publicDomain === 'string' ? normalizeDomainInput(publicDomain) : current.publicDomain;
     const cleanedToken =
-      typeof tunnelToken === 'string' && tunnelToken.trim()
-        ? cleanTokenInput(tunnelToken)
-        : current.tunnelToken;
+      typeof tunnelToken === 'string' && tunnelToken.trim() ? cleanTokenInput(tunnelToken) : current.tunnelToken;
 
     if (updatedMode === 'custom' && !cleanedToken) {
-      return res.status(400).json({
-        error: 'Cole o Token do seu túnel Cloudflare Zero Trust (ou o comando completo exibido no painel da Cloudflare).',
-      });
+      return res.status(400).json({ error: 'Cole o Token do seu túnel Cloudflare Zero Trust.' });
     }
 
-    const updatedSettings: HomelabSettings = {
+    writeJson(SETTINGS_FILE, {
       tunnelMode: updatedMode,
       publicDomain: updatedDomain,
       tunnelToken: cleanedToken,
-    };
-
-    writeSettings(updatedSettings);
-    await startOrRestartTunnel();
-
-    // Wait briefly so quick tunnel or named tunnel can report initial status
-    await new Promise((r) => setTimeout(r, 1500));
-
-    return res.json(getTunnelInfo());
-  } catch (error: any) {
-    return res.status(500).json({ error: 'Erro ao configurar túnel Cloudflare: ' + error.message });
-  }
-});
-
-// 13. DELETE /api/tunnel (Stop Cloudflare tunnel)
-app.delete('/api/tunnel', (req: Request, res: Response) => {
-  try {
-    const current = readSettings();
-    writeSettings({
-      ...current,
-      tunnelMode: 'off',
     });
-    stopTunnelProcess();
+    await startOrRestartTunnel();
+    await new Promise((r) => setTimeout(r, 1200));
     return res.json(getTunnelInfo());
   } catch (error: any) {
-    return res.status(500).json({ error: 'Erro ao desligar túnel Cloudflare' });
+    return res.status(500).json({ error: 'Erro ao configurar túnel: ' + error.message });
   }
 });
 
-// Serve frontend with Vite middlewares in development or static dist in production
+app.delete('/api/tunnel', (_req: Request, res: Response) => {
+  writeJson(SETTINGS_FILE, { ...readSettings(), tunnelMode: 'off' });
+  stopTunnelProcess();
+  return res.json(getTunnelInfo());
+});
+
 async function startServer() {
   if (process.env.NODE_ENV === 'production' && fs.existsSync(path.resolve(__dirname, 'dist'))) {
     app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (req: Request, res: Response) => {
+    app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
     });
   } else {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   }
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[UV Downloader] Servidor Homelab ativo em http://0.0.0.0:${PORT}`);
-    // Automatically start Cloudflare Tunnel if previously enabled in ./data/settings.json or .env
-    const initialSettings = readSettings();
-    if (initialSettings.tunnelMode !== 'off') {
-      startOrRestartTunnel().catch((err) => console.warn('Tunnel auto-start error:', err));
+    if (readSettings().tunnelMode !== 'off') {
+      startOrRestartTunnel().catch(() => {});
     }
   });
 }

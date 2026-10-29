@@ -5,8 +5,6 @@ import {
   Music,
   Video,
   Image as ImageIcon,
-  ExternalLink,
-  Layers,
   Copy,
   Clock,
   User,
@@ -14,7 +12,7 @@ import {
   X,
 } from 'lucide-react';
 import { MediaResult, QualityOption, HistoryRecord } from '../types';
-import { saveHistoryItem } from '../services/api';
+import { saveHistoryItem, triggerBrowserDownload } from '../services/api';
 
 interface MediaResultCardProps {
   media: MediaResult;
@@ -22,93 +20,38 @@ interface MediaResultCardProps {
   onClear: () => void;
 }
 
+const PLATFORM_BADGE_STYLES: Record<string, string> = {
+  youtube: 'bg-red-950/60 border-red-800/60 text-red-400',
+  instagram: 'bg-pink-950/60 border-pink-800/60 text-pink-400',
+  tiktok: 'bg-cyan-950/60 border-cyan-800/60 text-cyan-400',
+  pinterest: 'bg-rose-950/60 border-rose-800/60 text-rose-400',
+  generic: 'bg-sky-950/60 border-sky-800/60 text-sky-400',
+};
+
 export const MediaResultCard: React.FC<MediaResultCardProps> = ({
   media,
   onDownloadCompleted,
   onClear,
 }) => {
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
-  const [downloadProgress, setDownloadProgress] = useState<number>(0);
   const [downloadedIds, setDownloadedIds] = useState<Set<string>>(new Set());
   const [copiedLink, setCopiedLink] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'all' | 'video' | 'audio' | 'image'>('all');
   const [imgError, setImgError] = useState(false);
 
-  const filteredQualities = media.qualities.filter((q) => {
-    if (activeTab === 'all') return true;
-    return q.type === activeTab;
-  });
+  const filteredQualities = media.qualities.filter(
+    (q) => activeTab === 'all' || q.type === activeTab
+  );
 
   const handleDownload = async (quality: QualityOption) => {
     setDownloadingId(quality.id);
-    setDownloadProgress(0);
     setDownloadError(null);
 
     try {
-      const filename = `${media.title || 'media'}_${quality.resolution || quality.format}.${quality.format}`.replace(/[\\/:*?"<>|]/g, '_');
+      const filename = `${media.title || 'media'}_${quality.resolution || quality.format}.${quality.format}`;
+      await triggerBrowserDownload(quality.url, filename);
 
-      // 1. In-App Fetch with same-origin credentials to bypass mobile download-manager cookie issues
-      const response = await fetch(quality.url, {
-        credentials: 'include',
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => '');
-        throw new Error(errorText || `Erro no servidor (${response.status}) ao processar o arquivo.`);
-      }
-
-      const contentType = response.headers.get('content-type') || '';
-
-      // If the server accidentally returned an HTML page (e.g. cookie check or login wall)
-      if (contentType.includes('text/html') && quality.type !== 'image') {
-        throw new Error(
-          'A plataforma exigiu autenticação de cookies na rede. No seu homelab local esta restrição não ocorrerá.'
-        );
-      }
-
-      // Stream reading for accurate progress on mobile
-      const contentLength = response.headers.get('content-length');
-      let blob: Blob;
-
-      if (contentLength && response.body) {
-        const total = parseInt(contentLength, 10);
-        let loaded = 0;
-        const reader = response.body.getReader();
-        const chunks: Uint8Array[] = [];
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) {
-            chunks.push(value);
-            loaded += value.length;
-            setDownloadProgress(Math.min(99, Math.round((loaded / total) * 100)));
-          }
-        }
-        blob = new Blob(chunks as any, { type: contentType || 'application/octet-stream' });
-      } else {
-        // Fallback for servers without content-length
-        blob = await response.blob();
-      }
-
-      setDownloadProgress(100);
-
-      // 2. Save directly to mobile/desktop device using local Blob URL
-      const blobUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.style.display = 'none';
-      link.href = blobUrl;
-      link.setAttribute('download', filename);
-      document.body.appendChild(link);
-      link.click();
-
-      setTimeout(() => {
-        document.body.removeChild(link);
-        window.URL.revokeObjectURL(blobUrl);
-      }, 15000);
-
-      // 3. Persist record to homelab history
       const historyItem: HistoryRecord = {
         id: `${media.id}-${quality.id}-${Date.now()}`,
         originalUrl: media.originalUrl,
@@ -126,18 +69,11 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
 
       await saveHistoryItem(historyItem);
       onDownloadCompleted(historyItem);
-
       setDownloadedIds((prev) => new Set(prev).add(quality.id));
     } catch (err: any) {
-      console.error('Erro ao realizar download:', err);
-      setDownloadError(
-        err.message || 'Falha ao baixar o arquivo. Verifique sua conexão ou tente outra qualidade.'
-      );
+      setDownloadError(err.message || 'Falha ao baixar o arquivo.');
     } finally {
-      setTimeout(() => {
-        setDownloadingId(null);
-        setDownloadProgress(0);
-      }, 1200);
+      setTimeout(() => setDownloadingId(null), 1200);
     }
   };
 
@@ -149,23 +85,14 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
     }
   };
 
-  const platformBadgeStyles: Record<string, string> = {
-    youtube: 'bg-red-950/60 border-red-800/60 text-red-400',
-    instagram: 'bg-pink-950/60 border-pink-800/60 text-pink-400',
-    tiktok: 'bg-cyan-950/60 border-cyan-800/60 text-cyan-400',
-    pinterest: 'bg-rose-950/60 border-rose-800/60 text-rose-400',
-    generic: 'bg-sky-950/60 border-sky-800/60 text-sky-400',
-  };
-
   return (
     <div className="max-w-4xl mx-auto px-4 sm:px-6 mb-16">
       <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl">
-        {/* Card Header Strip */}
         <div className="px-5 py-3 bg-slate-950/50 border-b border-slate-800/80 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <span
               className={`text-xs font-semibold px-2.5 py-1 rounded border capitalize ${
-                platformBadgeStyles[media.platform] || platformBadgeStyles.generic
+                PLATFORM_BADGE_STYLES[media.platform] || PLATFORM_BADGE_STYLES.generic
               }`}
             >
               {media.platform}
@@ -202,7 +129,6 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
           </div>
         </div>
 
-        {/* Error alert inside card if download fails */}
         {downloadError && (
           <div className="mx-6 mt-4 p-3 bg-amber-950/40 border border-amber-800/60 rounded-xl flex items-start gap-2.5 text-amber-200 text-xs">
             <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
@@ -219,9 +145,7 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
           </div>
         )}
 
-        {/* Media Details: Split Layout */}
         <div className="p-6 grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
-          {/* Thumbnail preview */}
           <div className="md:col-span-5 relative group rounded-xl overflow-hidden bg-slate-950 aspect-video md:aspect-square flex items-center justify-center border border-slate-800">
             {media.thumbnail && !imgError ? (
               <img
@@ -250,7 +174,6 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
             </div>
           </div>
 
-          {/* Info & Format Options */}
           <div className="md:col-span-7 flex flex-col justify-between h-full">
             <div>
               <h2 className="text-lg sm:text-xl font-bold text-white mb-2 leading-snug line-clamp-2">
@@ -268,58 +191,34 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
                 <span className="text-emerald-400 font-medium">Original Stream</span>
               </div>
 
-              {/* Format Filter Tabs */}
               <div className="flex items-center gap-1 mb-4 p-1 bg-slate-950 rounded-lg border border-slate-800/80">
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('all')}
-                  className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-colors ${
-                    activeTab === 'all'
-                      ? 'bg-slate-800 text-white shadow-sm'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Todas Opções
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('video')}
-                  className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-colors flex items-center justify-center gap-1 ${
-                    activeTab === 'video'
-                      ? 'bg-slate-800 text-white shadow-sm'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  <Video className="w-3.5 h-3.5" />
-                  <span>Vídeo</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('audio')}
-                  className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-colors flex items-center justify-center gap-1 ${
-                    activeTab === 'audio'
-                      ? 'bg-slate-800 text-white shadow-sm'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  <Music className="w-3.5 h-3.5" />
-                  <span>Áudio</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('image')}
-                  className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-colors flex items-center justify-center gap-1 ${
-                    activeTab === 'image'
-                      ? 'bg-slate-800 text-white shadow-sm'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  <ImageIcon className="w-3.5 h-3.5" />
-                  <span>Fotos</span>
-                </button>
+                {(
+                  [
+                    { id: 'all', label: 'Todas Opções', icon: null },
+                    { id: 'video', label: 'Vídeo', icon: Video },
+                    { id: 'audio', label: 'Áudio', icon: Music },
+                    { id: 'image', label: 'Fotos', icon: ImageIcon },
+                  ] as const
+                ).map((tab) => {
+                  const Icon = tab.icon;
+                  return (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => setActiveTab(tab.id)}
+                      className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-colors flex items-center justify-center gap-1 ${
+                        activeTab === tab.id
+                          ? 'bg-slate-800 text-white shadow-sm'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {Icon && <Icon className="w-3.5 h-3.5" />}
+                      <span>{tab.label}</span>
+                    </button>
+                  );
+                })}
               </div>
 
-              {/* Qualities List */}
               <div className="space-y-2 max-h-[300px] overflow-y-auto pr-1">
                 {filteredQualities.length === 0 ? (
                   <p className="text-xs text-slate-500 py-4 text-center">
@@ -383,11 +282,7 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
                             {isDownloading ? (
                               <>
                                 <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                                <span>
-                                  {downloadProgress > 0
-                                    ? `${downloadProgress}%`
-                                    : 'Baixando...'}
-                                </span>
+                                <span>Baixando...</span>
                               </>
                             ) : isDownloaded ? (
                               <>
@@ -409,9 +304,8 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
               </div>
             </div>
 
-            {/* Note about homelab streaming & mobile */}
             <div className="mt-4 pt-3 border-t border-slate-800/80 text-[11px] text-slate-500 flex flex-col sm:flex-row sm:items-center justify-between gap-1">
-              <span>Streaming proxy via backend local (in-app blob download para celular & desktop)</span>
+              <span>Download direto com conexões paralelas (-N 8) e cache inteligente de 10 min</span>
               <span className="font-mono text-slate-400">100% Sem Marca d'Água</span>
             </div>
           </div>
